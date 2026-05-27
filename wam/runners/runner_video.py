@@ -127,6 +127,18 @@ def _resolve_video_runner_pretrained_base(
     return resolve_video_base_model_path(None)
 
 
+def _config_bool(config, key: str, default: bool = False) -> bool:
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        value = config.get(key, default)
+    else:
+        value = getattr(config, key, default)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 class VideoRunner(nn.Module, CompatiblePyTorchModelHubMixin):
     def __init__(
         self,
@@ -154,6 +166,12 @@ class VideoRunner(nn.Module, CompatiblePyTorchModelHubMixin):
             torch_dtype=dtype,
             local_files_only=True,
         )
+        video_frame_causal = _config_bool(config, "video_frame_causal_self_attn", False) or _config_bool(
+            config, "frame_causal_self_attention", False
+        )
+        self.model.frame_causal_self_attention = video_frame_causal
+        if hasattr(self.model, "register_to_config"):
+            self.model.register_to_config(frame_causal_self_attention=video_frame_causal)
         _should_load_ckpt = (
             pretrained_video_expert_path != "none"
             and os.path.exists(pretrained_video_expert_path)

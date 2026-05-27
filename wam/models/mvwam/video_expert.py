@@ -32,6 +32,8 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 
+from .frame_causal_mask import build_video_frame_causal_additive_mask, merge_attention_bias
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -521,6 +523,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         rotary_emb: torch.Tensor,
+        self_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -542,7 +545,7 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
+        attn_output = self.attn1(norm_hidden_states, None, self_attn_mask, rotary_emb)
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
@@ -641,6 +644,8 @@ class WanTransformer3DModel(
         added_kv_proj_dim: Optional[int] = None,
         rope_max_seq_len: int = 1024,
         pos_embed_seq_len: Optional[int] = None,
+        frame_causal_self_attention: bool = False,
+        video_frame_causal_self_attn: Optional[bool] = None,
     ) -> None:
         super().__init__()
 
@@ -678,6 +683,11 @@ class WanTransformer3DModel(
         self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
 
         self.gradient_checkpointing = False
+        self.frame_causal_self_attention = bool(
+            frame_causal_self_attention
+            if video_frame_causal_self_attn is None
+            else video_frame_causal_self_attn
+        )
 
     def process_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
@@ -754,6 +764,19 @@ class WanTransformer3DModel(
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        self_attn_mask = None
+        if getattr(self, "frame_causal_self_attention", False):
+            self_attn_mask = build_video_frame_causal_additive_mask(
+                post_patch_num_frames,
+                post_patch_height * post_patch_width,
+                hidden_states.device,
+                hidden_states.dtype,
+            )
+            self_attn_mask = merge_attention_bias(
+                attention_kwargs.pop("attention_mask", None) if attention_kwargs is not None else None,
+                self_attn_mask,
+                dtype=hidden_states.dtype,
+            )
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:
@@ -779,11 +802,11 @@ class WanTransformer3DModel(
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
                 hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, self_attn_mask
                 )
         else:
             for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, self_attn_mask)
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:

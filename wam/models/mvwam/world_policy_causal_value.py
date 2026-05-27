@@ -17,6 +17,13 @@ from diffusers.models.modeling_utils import ModelMixin
 
 from .action_expert import ActionExpertModel
 from .build_model import build_world_stack, compute_img_cond_len_and_pos_embed_config
+from .frame_causal_mask import (
+    bool_to_additive_mask,
+    build_action_self_causal_bool_mask,
+    build_action_to_video_frame_causal_bool_mask,
+    build_video_frame_causal_additive_mask,
+    merge_attention_bias,
+)
 from .video_expert import WanTransformer3DModel
 
 # action 联合注意力：随机屏蔽视频段 K 的概率（仅 video_kv_mask_mode="random" 时使用）
@@ -95,6 +102,13 @@ def build_action_joint_attention_mask(
     value: Optional[torch.Tensor],
     action_expert: ActionExpertModel,
     default_attention_backend: Optional[AttentionBackendName],
+    action_frame_causal_self_attn: bool = False,
+    action_video_frame_causal_kv: bool = False,
+    action_prefix_len: int = 0,
+    action_token_len: Optional[int] = None,
+    action_value_len: int = 0,
+    video_num_frames: Optional[int] = None,
+    video_tokens_per_frame: Optional[int] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[AttentionBackendName]]:
     """为 action 联合注意力构造 ``attn_mask_action`` 与 backend（与 ``forward`` 内原逻辑一致）。"""
     attn_mask_action = base_attention_mask
@@ -107,17 +121,29 @@ def build_action_joint_attention_mask(
     key_value_len = video_token_len + action_query_len
     negative_inf = torch.finfo(hidden_states_action.dtype).min
 
-    num_value_tokens = 0
+    num_value_tokens = int(action_value_len)
     if value is not None and hasattr(action_expert, "value_encoder"):
-        num_value_tokens = int(value.shape[1])
+        num_value_tokens = max(num_value_tokens, int(value.shape[1]))
     value_query_start = action_query_len - num_value_tokens if num_value_tokens > 0 else None
+    action_token_len = (
+        int(action_token_len)
+        if action_token_len is not None
+        else max(0, action_query_len - int(action_prefix_len) - num_value_tokens)
+    )
 
     video_kv_mask_per_sample = video_kv_mask_per_batch(
         video_kv_mask_mode, batch_size, hidden_states_action.device
     )
     mask_value_kv_for_non_value_queries = value_query_start is not None and value_query_start > 0
+    use_action_self_causal = bool(action_frame_causal_self_attn)
+    use_action_video_frame_causal = bool(action_video_frame_causal_kv and video_token_len > 0)
 
-    if not video_kv_mask_per_sample.any() and not mask_value_kv_for_non_value_queries:
+    if (
+        not video_kv_mask_per_sample.any()
+        and not mask_value_kv_for_non_value_queries
+        and not use_action_self_causal
+        and not use_action_video_frame_causal
+    ):
         return attn_mask_action, action_attn_backend
 
     additive_mask = torch.zeros(
@@ -135,6 +161,38 @@ def build_action_joint_attention_mask(
             additive_mask[masked_batch, value_query_start:action_query_len, :video_token_len] = 0
     if mask_value_kv_for_non_value_queries:
         additive_mask[:, :value_query_start, video_token_len + value_query_start : key_value_len] = negative_inf
+    if use_action_self_causal:
+        action_self_allowed = build_action_self_causal_bool_mask(
+            prefix_len=int(action_prefix_len),
+            action_len=action_token_len,
+            value_len=num_value_tokens,
+            device=hidden_states_action.device,
+        )
+        additive_mask[:, :, video_token_len:key_value_len] += bool_to_additive_mask(
+            action_self_allowed, hidden_states_action.dtype
+        ).unsqueeze(0)
+    if use_action_video_frame_causal:
+        if video_num_frames is None or video_tokens_per_frame is None:
+            raise ValueError(
+                "action_video_frame_causal_kv=true requires video_num_frames and video_tokens_per_frame."
+            )
+        action_to_video_allowed = build_action_to_video_frame_causal_bool_mask(
+            query_len=action_query_len,
+            prefix_len=int(action_prefix_len),
+            action_len=action_token_len,
+            value_len=num_value_tokens,
+            num_video_frames=int(video_num_frames),
+            tokens_per_video_frame=int(video_tokens_per_frame),
+            device=hidden_states_action.device,
+        )
+        if action_to_video_allowed.shape[1] != video_token_len:
+            raise ValueError(
+                "action/video frame causal mask shape mismatch: "
+                f"mask video tokens={action_to_video_allowed.shape[1]}, actual video tokens={video_token_len}"
+            )
+        additive_mask[:, :, :video_token_len] += bool_to_additive_mask(
+            action_to_video_allowed, hidden_states_action.dtype
+        ).unsqueeze(0)
 
     if attn_mask_action is None:
         attn_mask_action = additive_mask
@@ -163,6 +221,7 @@ def make_forward_joint_checkpoint_fn(
     layer_index: int,
     attention_mask: Optional[torch.Tensor],
     attn_mask_action: Optional[torch.Tensor],
+    video_attn_backend: Optional[AttentionBackendName],
     action_attn_backend: Optional[AttentionBackendName],
 ):
     """梯度检查点用：将 tensor 元组解包后调用 ``forward_joint``。"""
@@ -193,6 +252,7 @@ def make_forward_joint_checkpoint_fn(
             rotary_emb_action,
             attention_mask=attention_mask,
             attn_mask_action=attn_mask_action,
+            video_attn_backend=video_attn_backend,
             action_attn_backend=action_attn_backend,
         )
 
@@ -243,6 +303,7 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
 
         self._attention_backend = None
         self._parallel_config = None
+        self.action_video_frame_causal_kv = False
 
         self.gradient_checkpointing_func = None
         self.gradient_checkpointing = False
@@ -270,6 +331,7 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
         rotary_emb_action: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attn_mask_action: Optional[torch.Tensor] = None,
+        video_attn_backend: Optional[AttentionBackendName] = None,
         action_attn_backend: Optional[AttentionBackendName] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         query_video = key_video = value_video = None
@@ -340,6 +402,15 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
         value_concat = torch.cat(value_list, dim=1)
 
         if query_video is not None and key_video is not None and value_video is not None:
+            effective_video_backend = (
+                video_attn_backend
+                if video_attn_backend is not None
+                else (
+                    AttentionBackendName.NATIVE
+                    if attention_mask is not None
+                    else self._attention_backend
+                )
+            )
             attn_out_video = dispatch_attention_fn(
                 query_video,
                 key_video,
@@ -347,7 +418,7 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
                 attn_mask=attention_mask,
                 dropout_p=0.0,
                 is_causal=False,
-                backend=self._attention_backend,
+                backend=effective_video_backend,
                 parallel_config=self._parallel_config,
             )
             attn_out_video = attn_out_video.flatten(2, 3)
@@ -447,6 +518,8 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
 
         # --- video 分支预处理 ---
         rotary_emb = None
+        video_attention_mask = attention_mask
+        video_attn_backend: Optional[AttentionBackendName] = self._attention_backend
         if hidden_states_video is not None:
             batch_size, num_channels, num_frames, height, width = hidden_states_video.shape
             patch_t, patch_h, patch_w = self.video_expert.config.patch_size
@@ -457,6 +530,20 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
             rotary_emb = self.video_expert.rope(hidden_states_video)
             hidden_states_video = self.video_expert.patch_embedding(hidden_states_video)
             hidden_states_video = hidden_states_video.flatten(2).transpose(1, 2)
+            if getattr(self.video_expert, "frame_causal_self_attention", False):
+                video_frame_causal_mask = build_video_frame_causal_additive_mask(
+                    post_patch_num_frames,
+                    post_patch_height * post_patch_width,
+                    hidden_states_video.device,
+                    hidden_states_video.dtype,
+                )
+                video_attention_mask = merge_attention_bias(
+                    video_attention_mask,
+                    video_frame_causal_mask,
+                    dtype=hidden_states_video.dtype,
+                )
+            if video_attention_mask is not None:
+                video_attn_backend = AttentionBackendName.NATIVE
 
             if timestep_video is not None:
                 if timestep_video.ndim == 2:
@@ -495,7 +582,13 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
 
         # --- action 分支预处理 ---
         rotary_emb_action = None
+        action_prefix_len = 0
+        action_token_len = 0
+        action_value_len = 0
         if hidden_states_action is not None and hidden_states_robostate is not None:
+            action_prefix_len = hidden_states_robostate.shape[1]
+            action_token_len = hidden_states_action.shape[1]
+            action_value_len = value.shape[1] if value is not None and hasattr(self.action_expert, "value_encoder") else 0
             hidden_states_action = self.action_expert.encode_action_state(
                 hidden_states_action, hidden_states_robostate, value=value
             )
@@ -555,6 +648,17 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
                 value=value,
                 action_expert=self.action_expert,
                 default_attention_backend=self._attention_backend,
+                action_frame_causal_self_attn=getattr(
+                    self.action_expert, "frame_causal_self_attention", False
+                ),
+                action_video_frame_causal_kv=getattr(self, "action_video_frame_causal_kv", False),
+                action_prefix_len=action_prefix_len,
+                action_token_len=action_token_len,
+                action_value_len=action_value_len,
+                video_num_frames=post_patch_num_frames if hidden_states_video is not None else None,
+                video_tokens_per_frame=(
+                    post_patch_height * post_patch_width if hidden_states_video is not None else None
+                ),
             )
 
         # --- 逐层联合前向 ---
@@ -580,8 +684,9 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
                     make_forward_joint_checkpoint_fn(
                         self,
                         layer_idx,
-                        attention_mask,
+                        video_attention_mask,
                         attn_mask_action,
+                        video_attn_backend,
                         action_attn_backend,
                     ),
                     *checkpoint_inputs,
@@ -609,9 +714,10 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
                     timestep_proj_act,
                     rotary_emb,
                     rotary_emb_action,
-                    attention_mask,
-                    attn_mask_action,
-                    action_attn_backend,
+                    attention_mask=video_attention_mask,
+                    attn_mask_action=attn_mask_action,
+                    video_attn_backend=video_attn_backend,
+                    action_attn_backend=action_attn_backend,
                 )
             else:
                 hidden_states_video, _ = self.forward_joint(
@@ -625,9 +731,10 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
                     None,
                     rotary_emb,
                     rotary_emb_action,
-                    attention_mask,
-                    attn_mask_action,
-                    action_attn_backend,
+                    attention_mask=video_attention_mask,
+                    attn_mask_action=attn_mask_action,
+                    video_attn_backend=video_attn_backend,
+                    action_attn_backend=action_attn_backend,
                 )
 
         # --- 输出后处理 ---

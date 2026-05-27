@@ -37,6 +37,8 @@ from diffusers.models.normalization import FP32LayerNorm
 import re
 from collections import OrderedDict
 
+from .frame_causal_mask import build_action_self_causal_additive_mask
+
 """
 使用siglip视觉编码器, 只有cross attention
 """
@@ -666,6 +668,7 @@ class WanTransformerBlock(nn.Module):
         temb: Optional[torch.Tensor] = None,
         rotary_emb: Optional[torch.Tensor] = None,
         visual_len: Optional[int] = None,
+        self_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -688,7 +691,7 @@ class WanTransformerBlock(nn.Module):
         # 1. Self-attention
         if hasattr(self, 'attn1'):
             norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-            attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb, visual_len)
+            attn_output = self.attn1(norm_hidden_states, None, self_attn_mask, rotary_emb, visual_len)
             hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
@@ -799,12 +802,19 @@ class ActionExpertModel(
         use_new_rope: bool = False,
         scaling: float = 4.0,
         use_value: bool = False,
+        frame_causal_self_attention: bool = False,
+        frame_causal_self_attn: Optional[bool] = None,
     ) -> None:
         super().__init__()
 
         # inner_dim = num_attention_heads * attention_head_dim
         out_action_dim = out_action_dim or in_action_dim
         self.hidden_size = inner_dim
+        self.frame_causal_self_attention = bool(
+            frame_causal_self_attention
+            if frame_causal_self_attn is None
+            else frame_causal_self_attn
+        )
         # 1. Patch & position embedding
         if visual_encoder_type == "siglip2":
             self.visual_encoder = self.build_mlp(
@@ -1015,6 +1025,14 @@ class ActionExpertModel(
             use_new_rope=config.use_new_rope if hasattr(config, 'use_new_rope') else False,
             scaling=config.scaling if hasattr(config, 'scaling') else 4.0,
             use_value=config.use_value if hasattr(config, 'use_value') else False,
+            frame_causal_self_attention=(
+                config.get(
+                    "frame_causal_self_attn",
+                    config.get("frame_causal_self_attention", False),
+                )
+                if hasattr(config, "get")
+                else getattr(config, "frame_causal_self_attn", getattr(config, "frame_causal_self_attention", False))
+            ),
         )
         if load_weights_from_transformer:
             # 获取两个模型的 state_dict
@@ -1085,6 +1103,8 @@ class ActionExpertModel(
 
         visual_len = hidden_states_visual.shape[1]
         action_chunk_size = hidden_states.shape[1]
+        prefix_len = hidden_states_states.shape[1]
+        value_len = value.shape[1] if value is not None and hasattr(self, 'value_encoder') else 0
         # hidden_states = self.action_encoder(hidden_states)
         # hidden_states_states = self.state_encoder(hidden_states_states) 
         hidden_states = torch.cat([hidden_states_states, hidden_states], dim=1)
@@ -1096,6 +1116,15 @@ class ActionExpertModel(
             hidden_states = hidden_states + self.pos_embedding[:, :hidden_states.shape[1]]
         elif hasattr(self, 'pos_embedding_rope'):
             rotary_emb = self.pos_embedding_rope(num_actions=hidden_states.shape[1])
+        self_attn_mask = None
+        if getattr(self, "frame_causal_self_attention", False):
+            self_attn_mask = build_action_self_causal_additive_mask(
+                prefix_len=prefix_len,
+                action_len=action_chunk_size,
+                value_len=value_len,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:
@@ -1124,11 +1153,24 @@ class ActionExpertModel(
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for idx, block in enumerate(self.blocks):
                 hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states if idx %2 == 0 else hidden_states_visual, timestep_proj, rotary_emb, visual_len
+                    block,
+                    hidden_states,
+                    encoder_hidden_states if idx %2 == 0 else hidden_states_visual,
+                    timestep_proj,
+                    rotary_emb,
+                    visual_len,
+                    self_attn_mask,
                 )
         else:
             for idx, block in enumerate(self.blocks):
-                hidden_states = block(hidden_states, encoder_hidden_states if idx %2 == 0 else hidden_states_visual, timestep_proj, rotary_emb, visual_len)
+                hidden_states = block(
+                    hidden_states,
+                    encoder_hidden_states if idx %2 == 0 else hidden_states_visual,
+                    timestep_proj,
+                    rotary_emb,
+                    visual_len,
+                    self_attn_mask,
+                )
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:

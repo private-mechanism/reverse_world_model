@@ -24,6 +24,23 @@ def _common_get(common, key: str, default=None):
     return default if v is None else v
 
 
+def _config_get(config, key: str, default=None):
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        value = config.get(key, default)
+    else:
+        value = getattr(config, key, default)
+    return default if value is None else value
+
+
+def _config_bool(config, key: str, default: bool = False) -> bool:
+    value = _config_get(config, key, default)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def resolve_vision_num_patches_from_common(common) -> int:
     """从 ``common`` 解析每图 patch 数（与 ``SiglipVisionTower.num_patches`` 一致）。
 
@@ -118,18 +135,23 @@ def build_video_expert(
     pretrained_video_expert_path: str = "none",
     dtype=torch.bfloat16,
     pretrained_video_expert_base_path: str | None = None,
+    frame_causal_self_attention: bool = False,
 ) -> WanTransformer3DModel:
     """构造 ``WanTransformer3DModel``：底座来自 ``pretrained_video_expert_base_path``，可按路径叠加微调权重。"""
     pretrained_video_expert_path = _normalize_expert_path(pretrained_video_expert_path)
     base_path = pretrained_video_expert_base_path or resolve_video_base_model_path(None)
 
     if pretrained_video_expert_path != "none" and "WoW" in pretrained_video_expert_path:
-        return WanTransformer3DModel.from_pretrained(
+        video_expert = WanTransformer3DModel.from_pretrained(
             pretrained_video_expert_path,
             subfolder="transformer",
             torch_dtype=dtype,
             local_files_only=True,
         )
+        video_expert.frame_causal_self_attention = bool(frame_causal_self_attention)
+        if hasattr(video_expert, "register_to_config"):
+            video_expert.register_to_config(frame_causal_self_attention=bool(frame_causal_self_attention))
+        return video_expert
     video_expert = WanTransformer3DModel.from_pretrained(
         base_path,
         subfolder="transformer",
@@ -157,6 +179,9 @@ def build_video_expert(
                 if "model." in key:
                     state_dict[key.replace("model.", "")] = value
             video_expert.load_state_dict(state_dict)
+    video_expert.frame_causal_self_attention = bool(frame_causal_self_attention)
+    if hasattr(video_expert, "register_to_config"):
+        video_expert.register_to_config(frame_causal_self_attention=bool(frame_causal_self_attention))
     return video_expert
 
 
@@ -236,6 +261,11 @@ def build_world_stack(
     else:
         use_full_wam = False
 
+    video_frame_causal = _config_bool(config, "video_frame_causal_self_attn", False) or _config_bool(
+        config, "frame_causal_self_attention", False
+    )
+    action_video_frame_causal = _config_bool(config, "action_video_frame_causal_kv", False)
+
     if use_full_wam:
         action_expert = build_action_expert(
             config.action_expert,
@@ -249,8 +279,10 @@ def build_world_stack(
             pretrained_video_expert_path="none",
             dtype=dtype,
             pretrained_video_expert_base_path=base_path,
+            frame_causal_self_attention=video_frame_causal,
         )
         world = WorldPolicyModel(video_expert, action_expert)
+        world.action_video_frame_causal_kv = action_video_frame_causal
         load_wam_checkpoint_into_world_policy(world, str(wam_path))
         return world
 
@@ -266,8 +298,11 @@ def build_world_stack(
         pretrained_video_expert_path=pretrained_video_expert_path,
         dtype=dtype,
         pretrained_video_expert_base_path=base_path,
+        frame_causal_self_attention=video_frame_causal,
     )
-    return WorldPolicyModel(video_expert, action_expert)
+    world = WorldPolicyModel(video_expert, action_expert)
+    world.action_video_frame_causal_kv = action_video_frame_causal
+    return world
 
 
 __all__ = [
