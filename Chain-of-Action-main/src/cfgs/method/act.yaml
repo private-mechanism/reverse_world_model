@@ -1,0 +1,49 @@
+# @package _global_
+
+method_name: act
+method:
+  _target_: src.methods.act.ACT
+  device: ${device}
+  lr: 1e-4
+  lr_backbone: 1e-5
+  weight_decay: 1e-4
+  num_train_steps: ${num_pretrain_steps}
+  adaptive_lr: true
+  use_lang_cond: True
+  loss_type: l1
+
+  # modeling settings
+  action_order: FORWARD
+  action_sequence: 20 # action_chunk size
+  action_padding: zero
+  mtp: false
+  action_mode: ${env.action_mode}
+  execution_length: ${execution_length}
+
+  actor_model:
+    _target_: src.methods.act.ActorModel
+    _partial_: true
+    hidden_dim: 512
+    enc_layers: 4
+    dec_layers: 7
+    dim_feedforward: 3200
+    dropout: 0.1
+    nheads: 8
+    num_queries: 100
+    pre_norm: false
+    state_dim: 8
+    action_dim: 8
+    use_lang_cond: ${method.use_lang_cond}
+    latent_token: true
+
+  encoder_model:
+    _target_: src.methods.act.ImageEncoder
+    _partial_: true
+    input_shape: [2, 3, 128, 128]  # [views, channels, height, width]
+    hidden_dim: ${method.actor_model.hidden_dim}
+    position_embedding: "sine"
+    lr_backbone: ${method.lr_backbone}
+    masks: False
+    backbone: "resnet18"
+    dilation: False
+    use_lang_cond: ${method.use_lang_cond}

@@ -1,0 +1,13 @@
+{
+    "robomind2lerobot_AGILEX2hdf5": 20,
+    "robomind2lerobot_FRANKA2hdf5": 20,
+    "robomind2lerobot_UR2hdf5": 20,
+    "robomind2UR2hdf5": 20,
+    "songling_tasks": 30,
+    "tianyi_data": 30,
+    "agibot": 30,
+    "robocoin": 30,
+    "robomind": 20,
+    "robotwin": 15,
+    "agilex": 30
+}

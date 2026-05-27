@@ -1,0 +1,134 @@
+# =============================================================================
+# 天工 / tienkung 真机 HDF5 任务 — schema_version: 2（与 model_config/wam_demo.yml 对齐）
+# 自 RoboTwin/policy/RDT/model_config/0509-i3-tienkung-pick-up-neat-clothes.yml 迁移；数据路径与旧 checkpoint 子目录名保持不变。
+# 控制频率表：configs/real_world_control_freqs.json（原 RDT data/control_freqs.json 副本）。
+# 权重路径请按本机修改；缓冲路径 data.dataset.buf_path 必填。
+# =============================================================================
+
+schema_version: 2
+
+experiment:
+  id: robotwin-25000-wan
+  wandb_project: WorldPolicy-DownStream
+  cuda_visible_devices: "0,1,2,3,4,5"
+
+data:
+  paths:
+    - /mnt/dataset/datasets/RoboTwin2_0_processed/tianyi_data/processed_0506/tienyi_prod2_dualArm-gripper-3cameras_39_pick_up_neat_clothes_20260429_am
+  consumer_dataset_type: finetune
+  hdf5:
+    use_prompt_template: false
+    control_freqs_path: configs/real_world_control_freqs.json
+    target_control_freq: 15
+  common:
+    img_history_size: 1
+    action_chunk_size: 32
+    num_cameras: 3
+    num_vision_patches: 729
+    state_dim: 128
+    norm_minmax: true
+    statistics_mode: separate
+  dataset:
+    buf_path: /path/to/buffer
+    buf_num_chunks: 512
+    buf_chunk_size: 512
+    epsd_len_thresh_low: 32
+    epsd_len_thresh_high: 2048
+    image_aspect_ratio: pad
+    tokenizer_max_length: 1024
+    pred_video: true
+    sample_video_fps: 1
+    video_size: [384, 320]
+    num_cameras: 1
+
+architecture:
+  model:
+    action_expert:
+      in_action_dim: 256
+      in_visual_dim: 1152
+      out_action_dim: 128
+      inner_dim: 768
+      num_layers: 30
+      num_attention_heads: 12
+      attention_head_dim: 128
+      text_dim: 4096
+      freq_dim: 256
+      ffn_dim: 3072
+      max_seq_len: 512
+      visual_encoder_type: siglip2
+      eps: 1.0e-06
+      use_new_rope: true
+      scaling: 4.0
+      use_value: true
+    action_noise_scheduler:
+      type: flow
+      num_train_timesteps: 1000
+      num_inference_timesteps: 5
+      beta_schedule: squaredcos_cap_v2
+      prediction_type: sample
+      clip_sample: false
+      alpha: 1.5
+      beta: 1.0
+      noise_s: 0.999
+      distribution_type: beta
+
+  model_name: world_policy_causal_value
+  causal_world_training: true
+  dataset_type: 128dim_with_value
+  image_aug_type: mixed
+
+checkpoints:
+  run_name: 0509-i3-tienkung-pick-up-neat-clothes
+  root_dir: checkpoints
+
+weights:
+  text_encoder: /mnt/dataset/projs/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
+  vision_encoder: /mnt/dataset/ckpt/pretrained_models/siglip2-so400m-patch14-384/
+  action_expert: none
+  video_expert: checkpoints/rb-motus-video-c32/checkpoint-15000
+
+training:
+  batch:
+    train: 4
+    sample: 1
+  vae_mini_batch: 4
+  max_train_steps: 15000
+  checkpointing_period: 1000
+  sample_period: 200
+  checkpoints_total_limit: 5
+  dataloader_num_workers: 8
+  gradient_accumulation_steps: 1
+  state_noise_snr: 40
+  cond_mask_prob: -1
+  ema:
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+
+optimizer:
+  learning_rate: 0.0001
+  lr:
+    scheduler: custom_constant_then_decay
+    warmup_steps: 10
+    hold_ratio: 0.2
+
+logging:
+  report_to: tensorboard
+
+runtime:
+  mixed_precision: bf16
+  load_from_hdf5: true
+  gradient_checkpointing: true
+  image_aug: true
+
+distributed:
+  deepspeed: off
+
+inference: {}
+
+# 与旧 RDT 扁平 yml 一致；HDF5 管线若接入 skip_still 可读取这些键
+skip_still_steps: false
+skip_still_window: 2
+skip_still_eps: 1.0e-4

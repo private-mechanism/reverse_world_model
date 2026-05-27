@@ -1,0 +1,56 @@
+
+defaults:
+  - base: base_config
+  - env: rlbench
+  - method: coa
+  - _self_
+  - override env: episode_length
+
+# Universal settings
+num_train_steps: 20000
+eval_every_steps: 10000
+vis_every_steps: 2000
+save_every_steps: 10000
+num_eval_episodes: 25
+update_every_steps: 1
+snapshot: null
+tag: null
+exp_root: .
+
+
+# dataloader settings
+batch_size: 128
+num_workers: 0
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 0
+
+# data settings
+task: null
+demos: 100
+dataset_root: data/rlbench
+dataset_root_train: ${dataset_root}/train
+dataset_root_eval: ${dataset_root}/eval
+
+# env
+pixels: true
+visual_observation_shape: [128, 128]
+env:
+  env_name: rlbench
+  task_name: ${task}
+  is_pkl: true
+  modality: rgb # pointcloud 
+  action_mode: ABS_END_EFFECTOR_POSE
+  cameras: ["front", "wrist", "left_shoulder", "right_shoulder"]
+  renderer: opengl3
+  arm_max_velocity: 1.0
+  arm_max_acceleration: 4.0
+  episode_length: ${env.tasks.${env.task_name}.episode_length}
+  episode_length_decay_rate: 1
+  frame_stack: 1
+
+hydra:
+  run:
+    dir: ${exp_root}/exp_local/${method_name}/rlbench_${env.task_name}_${now:%Y%m%d%H%M%S}
+
+

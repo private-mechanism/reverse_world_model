@@ -1,0 +1,66 @@
+# @package _global_
+method_name: coa
+method:
+  _target_: src.methods.coa.CoA
+  # general settings
+  lr: 1e-4
+  lr_backbone: 1e-5
+  weight_decay: 1e-4
+  num_train_steps: ${num_train_steps}
+  adaptive_lr: false
+  actor_grad_clip: 1.0
+  use_lang_cond: False
+
+  # coa-specific settings
+  action_order: REVERSE
+  action_sequence: variable # will be updated in the env wrapper, depends on the max sub-trajectory length
+  action_mode: ${env.action_mode}
+  execution_length: ${execution_length}
+  action_padding: zero
+  keyframe_only: false
+  full_traj_training: false
+  keyframe_loss_weight: 1
+  execute_threshold: 0.01
+  mtp: true
+  traj_sample_margin: 0
+
+  # loss settings
+  latent_loss_type: l1
+  loss_type: l1
+  
+  
+
+  actor_model:
+    _target_: src.methods.coa.ActorModel
+    _partial_: true
+    hidden_dim: 512
+    enc_layers: 4
+    # Note: Although the original ACT implementation has 7 for `n_decoder_layers`, there is a bug in the code
+    # that means only the first layer is used in the original implementation. Here we modify it to 6 and plus 1 mtp layer, so it's 7 in total.
+    # See this issue https://github.com/tonyzhaozh/act/issues/25#issue-2258740521.
+    dec_layers: 6
+    dim_feedforward: 3200
+    dropout: 0.1
+    nheads: 8
+    nmtpheads: 2
+    num_queries: ${action_sequence}
+    pre_norm: true
+    state_dim: 8
+    action_dim: 8
+    use_lang_cond: ${method.use_lang_cond}
+    action_order: ${method.action_order}
+    execute_threshold: ${method.execute_threshold}
+    execution_length: ${method.execution_length}
+
+  encoder_model:
+    _target_: src.methods.coa.ImageEncoder
+    _partial_: true
+    input_shape: [4, 3, 128, 128]
+    hidden_dim: ${method.actor_model.hidden_dim}
+    position_embedding: "sine"
+    lr_backbone: ${method.lr_backbone}
+    masks: False
+    backbone: "resnet18"
+    dilation: False
+    use_frozen_bn: true
+    use_lang_cond: ${method.use_lang_cond}

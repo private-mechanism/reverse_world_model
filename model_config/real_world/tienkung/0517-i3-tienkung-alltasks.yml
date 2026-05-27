@@ -1,0 +1,133 @@
+# =============================================================================
+# 多任务混合：processed_0506 下 tienyi_prod2 全部 HDF5 根目录。
+# 说明：HDF5 统计默认以 paths 列表第一项为主目录；多根混合时请确认 statistics 与归一化策略。
+# 其余超参与单任务 real_world 配置一致；混合训练可适当增大 max_train_steps。
+# =============================================================================
+
+schema_version: 2
+
+experiment:
+  id: robotwin-25000-wan
+  wandb_project: WorldPolicy-DownStream
+  cuda_visible_devices: "0,1,2,3,4,5"
+
+data:
+  paths:
+    - /mnt/dataset/datasets/RoboTwin2_0_processed/tianyi_data/processed_0506/
+  consumer_dataset_type: finetune
+  hdf5:
+    use_prompt_template: false
+    control_freqs_path: configs/real_world_control_freqs.json
+    target_control_freq: 15
+  common:
+    img_history_size: 1
+    action_chunk_size: 32
+    num_cameras: 3
+    num_vision_patches: 729
+    state_dim: 128
+    norm_minmax: true
+    statistics_mode: separate
+  dataset:
+    buf_path: /path/to/buffer
+    buf_num_chunks: 512
+    buf_chunk_size: 512
+    epsd_len_thresh_low: 32
+    epsd_len_thresh_high: 2048
+    image_aspect_ratio: pad
+    tokenizer_max_length: 1024
+    pred_video: true
+    sample_video_fps: 1
+    video_size: [384, 320]
+    num_cameras: 1
+
+architecture:
+  model:
+    action_expert:
+      in_action_dim: 256
+      in_visual_dim: 1152
+      out_action_dim: 128
+      inner_dim: 768
+      num_layers: 30
+      num_attention_heads: 12
+      attention_head_dim: 128
+      text_dim: 4096
+      freq_dim: 256
+      ffn_dim: 3072
+      max_seq_len: 512
+      visual_encoder_type: siglip2
+      eps: 1.0e-06
+      use_new_rope: true
+      scaling: 4.0
+      use_value: false
+    action_noise_scheduler:
+      type: flow
+      num_train_timesteps: 1000
+      num_inference_timesteps: 5
+      beta_schedule: squaredcos_cap_v2
+      prediction_type: sample
+      clip_sample: false
+      alpha: 1.0
+      beta: 1.0
+      noise_s: 0.999
+      distribution_type: beta
+
+  model_name: world_policy_causal_value
+  causal_world_training: true
+  dataset_type: 128dim_with_value
+  image_aug_type: mixed
+
+checkpoints:
+  run_name: 0517-i3-tienkung-alltasks
+  root_dir: /mnt/dataset/ckpt/checkpoints/wam/checkpoints/
+
+weights:
+  pretrained_model_name_or_path: /mnt/dataset/ckpt/checkpoints/worldpolicy/checkpoints/0406-MoT-pretrain-c32-s4-i3/checkpoint-15000
+  text_encoder: /mnt/dataset/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
+  vision_encoder: /mnt/dataset/datasets/cjt_personal/pretrained_models/siglip2-so400m-patch14-384
+  action_expert: none
+  video_expert: none
+
+training:
+  batch:
+    train: 8
+    sample: 8
+  vae_mini_batch: 8
+  max_train_steps: 20000
+  checkpointing_period: 1000
+  sample_period: 200
+  checkpoints_total_limit: 5
+  dataloader_num_workers: 8
+  gradient_accumulation_steps: 1
+  state_noise_snr: 40
+  cond_mask_prob: -1
+  ema:
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+
+optimizer:
+  learning_rate: 0.0001
+  lr:
+    scheduler: custom_constant_then_decay
+    warmup_steps: 10
+    hold_ratio: 0.2
+
+logging:
+  report_to: wandb
+
+runtime:
+  mixed_precision: bf16
+  load_from_hdf5: true
+  gradient_checkpointing: true
+  image_aug: true
+
+distributed:
+  deepspeed: off
+
+inference: {}
+
+skip_still_steps: false
+skip_still_window: 2
+skip_still_eps: 1.0e-4

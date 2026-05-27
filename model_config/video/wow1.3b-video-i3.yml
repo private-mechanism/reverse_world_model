@@ -1,0 +1,102 @@
+# =============================================================================
+# Video-only smoke：``weights.video_base_model`` 为 Wan2.2 时，``train_video`` 自动使用
+# ``video_variant='wan22'``（与 5B 通道/前向一致）；WoW 默认 ``video_variant='wow'``。
+# 与「因果 world + 128dim value」无绑定：此处 dataset_type 不走 128dim*，使用通用 HDF5VLADataset。
+# 启动（WAM 根目录）：
+#   ./train_video_local.sh smoke-video-wow
+# 多节点百度集群：./train_video.sh smoke-video-wow（需调度注入 WORLD_SIZE、NPROC_PER_NODE 等）
+# 请修改 data.paths、weights.*；meta 中 dataset_name 为 agilex 时需 configs/dataset_stat.json 含 agilex。
+# =============================================================================
+schema_version: 2
+
+experiment:
+  id: wow1.3b-video-i3
+  wandb_project: WAM-Video
+  config_name: wow1.3b-video-i3
+
+data:
+  paths:
+    - /mnt/dataset/datasets/RoboTwin2_0_processed/robotwin_clean_5k_2
+  consumer_dataset_type: finetune
+  hdf5:
+    use_prompt_template: false
+  common:
+    img_history_size: 1
+    action_chunk_size: 32
+    num_cameras: 3
+    num_vision_patches: 729
+    state_dim: 128
+    norm_minmax: false
+  dataset:
+    image_aspect_ratio: pad
+    tokenizer_max_length: 512
+    pred_video: true
+    sample_video_fps: 1
+    video_size: [384, 320]
+    num_cameras: 3
+
+architecture:
+  model:
+    noise_scheduler:
+      type: normal
+      num_train_timesteps: 1000
+      num_inference_timesteps: 20
+      prediction_type: sample
+  # 非 128dim / 128dim_with_value → data/dataset.py 选用 HDF5VLADataset（与 world 因果 128dim 配置独立）
+  dataset_type: robotwin
+  image_aug_type: mixed
+
+checkpoints:
+  run_name: wow1.3b-video-i3
+  root_dir: /mnt/dataset/ckpt/checkpoints/wam/checkpoints/
+
+weights:
+  video_base_model: /mnt/dataset/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
+  text_encoder: /mnt/dataset/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
+  vision_encoder: /mnt/dataset/datasets/cjt_personal/pretrained_models/siglip2-so400m-patch14-384
+  video_expert: none
+
+training:
+  # 单卡 ~80GB：batch=8 + EMA 全量副本 + 无 checkpointing 易 OOM；可用 grad_accum 维持有效 batch
+  batch:
+    train: 2
+    sample: 2
+  vae_mini_batch: 4
+  max_train_steps: 20000
+  checkpointing_period: 2000
+  sample_period: 500
+  checkpoints_total_limit: 2
+  dataloader_num_workers: 8
+  gradient_accumulation_steps: 4
+  cond_mask_prob: -1
+  ema:
+    enabled: false
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+
+optimizer:
+  learning_rate: 1.0e-5
+  lr:
+    scheduler: constant
+    warmup_steps: 0
+
+logging:
+  report_to: tensorboard
+  resume_from_checkpoint: null
+
+runtime:
+  mixed_precision: bf16
+  load_from_hdf5: true
+  gradient_checkpointing: true
+  image_aug: false
+  train_runner_module: runner_video
+  train_runner_class: VideoRunner
+  video_sample_guidance: 1.0
+
+distributed:
+  deepspeed: off
+
+inference: {}
