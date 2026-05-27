@@ -9,6 +9,8 @@ import os
 import numpy as np
 from accelerate.utils import broadcast_object_list
 
+from wam.samples.quick_metrics import compute_video_l1_psnr_ssim, latent_l1
+
 
 def value_to_value_frame(value: torch.Tensor, noisy_video: torch.Tensor) -> torch.Tensor:
     """将 value 扩展为与 noisy_video 单帧相同的空间尺寸 (b, c, 1, h, w)。"""
@@ -190,6 +192,7 @@ def log_sample_res(
 
         # 训练期轻量采样：只做 action-only 一次，避免 causal 下 AE+联合 两次 6B 推理 + VAE 解码 OOM。
         save_sample_video = bool(getattr(args, "sample_save_video", False))
+        sample_compute_video_metrics = bool(getattr(args, "sample_compute_video_metrics", False))
         sample_joint_only = bool(getattr(args, "sample_joint_only", False))
         if sample_joint_only:
             predict_runs = [(False, "")]
@@ -207,6 +210,8 @@ def log_sample_res(
                 "sample_save_video=false: skip VAE decode/mp4; joint samples save "
                 "sample_latents_rank*_case*.pt for offline decode."
             )
+        if sample_compute_video_metrics and accelerator.is_main_process:
+            logger.info("sample_compute_video_metrics=true: decode sample batches for video L1/PSNR/SSIM.")
         sync_each_batch = accelerator.num_processes > 1
         import torch.distributed as dist
 
@@ -296,6 +301,12 @@ def log_sample_res(
                 pred_actions = out["pred_trajectory"]
                 pred_video = out["pred_video"]
                 pred_value = out["pred_value"]
+                if pred_video is not None and video_latents is not None:
+                    latent_l1_loss = latent_l1(pred_video, video_latents)
+                    latent_l1_scaler = _reduce_metric(
+                        accelerator, latent_l1_loss, distributed_reduce=distributed_reduce
+                    )
+                    loss_for_log[log_key_prefix + "overall_avg_sample_latent_l1"] += latent_l1_scaler
                 if pred_value is not None:
                     value_gt = batch["value"].to(pred_value)
                     if pred_value.ndim == 5:
@@ -320,20 +331,40 @@ def log_sample_res(
                     pa_flag=pa_flag,
                     pred_video=pred_video,
                 )
-                if export_joint and save_sample_video:
+                can_decode_video_metrics = (
+                    sample_compute_video_metrics
+                    and pred_video is not None
+                    and video_latents is not None
+                    and (not sample_sharded_inference or accelerator.is_main_process)
+                )
+                decoded_for_export = export_joint and save_sample_video
+                if can_decode_video_metrics or decoded_for_export:
                     video_orig = vae.decode_to_video(video_latents, to_save=True)[0]
                     video_pred = vae.decode_to_video(pred_video, to_save=True)[0]
                     n_frames = min(video_orig.shape[0], video_pred.shape[0])
                     video_orig = video_orig[:n_frames]
                     video_pred = video_pred[:n_frames]
-                    video_concat = np.concatenate([video_orig, video_pred], axis=2)
-                    video_name = f"output_video_rank{rank_id}_case{step}.mp4"
-                    imageio.mimsave(
-                        os.path.join(sample_save_path, video_name),
-                        video_concat,
-                        fps=max(1, n_frames // 5),
-                        codec="libx264",
-                    )
+                    if can_decode_video_metrics:
+                        metric_reduce = distributed_reduce and not sample_sharded_inference
+                        video_metrics = compute_video_l1_psnr_ssim(video_pred, video_orig)
+                        for metric_name, metric_value in video_metrics.items():
+                            metric_scaler = _reduce_metric(
+                                accelerator,
+                                metric_value.to(accelerator.device),
+                                distributed_reduce=metric_reduce,
+                            )
+                            loss_for_log[
+                                log_key_prefix + "overall_avg_sample_" + metric_name
+                            ] += metric_scaler
+                    if decoded_for_export:
+                        video_concat = np.concatenate([video_orig, video_pred], axis=2)
+                        video_name = f"output_video_rank{rank_id}_case{step}.mp4"
+                        imageio.mimsave(
+                            os.path.join(sample_save_path, video_name),
+                            video_concat,
+                            fps=max(1, n_frames // 5),
+                            codec="libx264",
+                        )
                 elif export_joint and not save_sample_video:
                     _save_joint_sample_latents(
                         sample_save_path,
@@ -354,12 +385,14 @@ def log_sample_res(
                     accelerator, mse_loss, distributed_reduce=distributed_reduce
                 )
                 loss_for_log[log_key_prefix + "overall_avg_sample_mse"] += mse_loss_scaler
+                loss_for_log[log_key_prefix + "overall_avg_sample_action_mse"] += mse_loss_scaler
 
                 l1_loss = (l1_elem * expanded_state_elem_mask).sum() / expanded_state_elem_mask.sum()
                 l1_loss_scaler = _reduce_metric(
                     accelerator, l1_loss, distributed_reduce=distributed_reduce
                 )
                 loss_for_log[log_key_prefix + "overall_avg_sample_l1"] += l1_loss_scaler
+                loss_for_log[log_key_prefix + "overall_avg_sample_action_l1"] += l1_loss_scaler
                 del out, pred_actions, pred_video, pred_value, loss, l1_elem
 
             if sync_each_batch:
@@ -371,9 +404,27 @@ def log_sample_res(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        overall_mse_l1_keys = ["overall_avg_sample_mse", "overall_avg_sample_l1"]
+        overall_mse_l1_keys = [
+            "overall_avg_sample_mse",
+            "overall_avg_sample_l1",
+            "overall_avg_sample_action_mse",
+            "overall_avg_sample_action_l1",
+            "overall_avg_sample_latent_l1",
+            "overall_avg_sample_video_l1",
+            "overall_avg_sample_video_psnr",
+            "overall_avg_sample_video_ssim",
+        ]
         if action_only:
-            overall_mse_l1_keys = ["AE_overall_avg_sample_mse", "AE_overall_avg_sample_l1"] + overall_mse_l1_keys
+            overall_mse_l1_keys = [
+                "AE_overall_avg_sample_mse",
+                "AE_overall_avg_sample_l1",
+                "AE_overall_avg_sample_action_mse",
+                "AE_overall_avg_sample_action_l1",
+                "AE_overall_avg_sample_latent_l1",
+                "AE_overall_avg_sample_video_l1",
+                "AE_overall_avg_sample_video_psnr",
+                "AE_overall_avg_sample_video_ssim",
+            ] + overall_mse_l1_keys
         value_loss_keys = ["overall_avg_sample_l1_value_loss"]
         if action_only:
             value_loss_keys = ["AE_overall_avg_sample_l1_value_loss"] + value_loss_keys

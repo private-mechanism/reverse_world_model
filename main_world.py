@@ -330,6 +330,13 @@ def parse_args(input_args=None):
         help="Training-time sampling 是否 VAE decode 并保存 mp4。默认 false，避免 sample 阶段解码 OOM。",
     )
     parser.add_argument(
+        "--sample-compute-video-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        dest="sample_compute_video_metrics",
+        help="Training-time sampling 是否 VAE decode 计算 video L1/PSNR/SSIM。默认 false，避免 sample 阶段解码 OOM。",
+    )
+    parser.add_argument(
         "--sample-joint-only",
         action=argparse.BooleanOptionalAction,
         default=False,
