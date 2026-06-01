@@ -19,10 +19,12 @@ experiment:
   id: test-reverse-video-only
   wandb_project: WAM-Video-Reverse-Test
   config_name: test_reverse_video_only
+  cuda_visible_devices: "0,1"
+
 
 data:
   paths:
-    - /mnt/dataset/datasets/RoboTwin2_0_processed/robotwin_clean_5k_2
+    - /mnt/damoxing/datasets/RoboTwin2_0_processed/robotwin_clean_5k_2
   consumer_dataset_type: finetune
   hdf5:
     use_prompt_template: false
@@ -64,10 +66,10 @@ weights:
 
 training:
   batch:
-    train: 8
-    sample: 8
+    train: 2
+    sample: 2
   vae_mini_batch: 4
-  max_train_steps: 20000
+  max_train_steps: 5000
   checkpointing_period: 5000
   sample_period: 500
   sample_save_video: true
