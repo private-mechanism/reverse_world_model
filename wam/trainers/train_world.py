@@ -187,6 +187,22 @@ def resolve_sample_light_mode(args) -> bool:
     return args.deepspeed is not None
 
 
+def resolve_sample_period(args, attr_name: str) -> int:
+    period = int(getattr(args, attr_name, -1))
+    if period < 0:
+        period = int(getattr(args, "sample_period", -1))
+    return period
+
+
+def should_run_periodic(global_step: int, period: int) -> bool:
+    return period > 0 and global_step % period == 0
+
+
+def should_save_video_visual(args, global_step: int, period: int) -> bool:
+    first_sample = bool(getattr(args, "sample_video_visual_on_step0", True)) and global_step == 1
+    return first_sample or should_run_periodic(global_step, period)
+
+
 def release_memory_after_sampling(
     accelerator: Accelerator,
     vae,
@@ -226,6 +242,8 @@ def run_training_sample_logging(
     action_only: bool,
     sample_light: bool = False,
     sample_sharded_inference: bool = False,
+    compute_video_metrics: bool = True,
+    save_video: bool = False,
 ) -> dict:
     """训练期采样。``sample_sharded_inference=True`` 时与 ZeRO 训练一致：各 rank 同一 batch、分片权重集体
     ``predict_action``；否则各 rank 用 dataloader 分片各跑各的 batch（数据并行采样）。"""
@@ -279,6 +297,8 @@ def run_training_sample_logging(
         distributed_reduce=distributed_reduce,
         sample_light=sample_light,
         sample_sharded_inference=sample_sharded_inference,
+        compute_video_metrics=compute_video_metrics,
+        save_video=save_video,
     )
     release_memory_after_sampling(
         accelerator,
@@ -460,6 +480,7 @@ def train(args, logger):
     apply_model_config_to_training_args(model_config, args)
 
     model_structure = load_model_structure_dict(model_config)
+    args.reverse_video_order = bool(model_structure.get("dataset", {}).get("reverse_video_order", False))
     video_base_model_name = model_config.get("VIDEO_BASE_MODEL")
     if (
         video_base_model_name is not None
@@ -940,7 +961,9 @@ def train(args, logger):
     )
     progress_bar.set_description("Steps")
 
-    sample_enabled = int(getattr(args, "sample_period", -1)) > 0
+    sample_video_metric_period = resolve_sample_period(args, "sample_video_metric_period")
+    sample_video_visual_period = resolve_sample_period(args, "sample_video_visual_period")
+    sample_enabled = sample_video_metric_period > 0 or sample_video_visual_period > 0
     sample_light = resolve_sample_light_mode(args)
     sample_sharded_inference = resolve_sample_sharded_inference(
         args, use_ema_for_sampling=use_ema_for_sampling
@@ -994,7 +1017,15 @@ def train(args, logger):
                         checkpoints_total_limit=args.checkpoints_total_limit,
                     )
 
-                if sample_enabled and global_step % args.sample_period == 0:
+                run_video_metrics = (
+                    bool(getattr(args, "sample_compute_video_metrics", True))
+                    and should_run_periodic(global_step, sample_video_metric_period)
+                )
+                run_video_visual = (
+                    bool(getattr(args, "sample_save_video", False))
+                    and should_save_video_visual(args, global_step, sample_video_visual_period)
+                )
+                if sample_enabled and (run_video_metrics or run_video_visual):
                     sample_model = model if sample_sharded_inference else get_sampling_model()
                     sample_metrics = run_training_sample_logging(
                         enabled=True,
@@ -1012,6 +1043,8 @@ def train(args, logger):
                         action_only=causal_world_training,
                         sample_light=sample_light,
                         sample_sharded_inference=sample_sharded_inference,
+                        compute_video_metrics=run_video_metrics,
+                        save_video=run_video_visual,
                     )
                     if sample_metrics and accelerator.is_main_process:
                         logger.info(sample_metrics)

@@ -1,0 +1,108 @@
+# =============================================================================
+# Reverse video-only test.
+#
+# reverse_video_order=true trains/samples clips as [x_k, ..., x_t].
+# Metrics run every step; visual GT|PRED videos are saved every 500 steps.
+# =============================================================================
+schema_version: 2
+num_sample_batches: 1
+
+# Extra flat keys supported by the config loader.
+sample_compute_video_metrics: true
+sample_video_metric_period: 1
+sample_video_visual_period: 500
+sample_video_visual_on_step0: true
+sample_save_forward_view: true
+sample_video_max_rank: 16
+
+experiment:
+  id: test-reverse-video-only
+  wandb_project: WAM-Video-Reverse-Test
+  config_name: test_reverse_video_only
+
+data:
+  paths:
+    - /mnt/dataset/datasets/RoboTwin2_0_processed/robotwin_clean_5k_2
+  consumer_dataset_type: finetune
+  hdf5:
+    use_prompt_template: false
+  common:
+    img_history_size: 1
+    action_chunk_size: 32
+    num_cameras: 3
+    num_vision_patches: 729
+    state_dim: 128
+    norm_minmax: false
+  dataset:
+    image_aspect_ratio: pad
+    tokenizer_max_length: 512
+    pred_video: true
+    sample_video_fps: 1
+    video_size: [384, 320]
+    num_cameras: 3
+    reverse_video_order: true
+
+architecture:
+  model:
+    noise_scheduler:
+      type: normal
+      num_train_timesteps: 1000
+      num_inference_timesteps: 20
+      prediction_type: sample
+  dataset_type: robotwin
+  image_aug_type: mixed
+
+checkpoints:
+  run_name: test-reverse-video-only
+  root_dir: /mnt/world_foundational_model/fyzhao/reverse_world_model/checkpoints/
+
+weights:
+  video_base_model: /mnt/dataset/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
+  text_encoder: /mnt/dataset/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
+  vision_encoder: /mnt/dataset/datasets/cjt_personal/pretrained_models/siglip2-so400m-patch14-384
+  video_expert: none
+
+training:
+  batch:
+    train: 8
+    sample: 8
+  vae_mini_batch: 4
+  max_train_steps: 20000
+  checkpointing_period: 5000
+  sample_period: 500
+  sample_save_video: true
+  checkpoints_total_limit: 2
+  dataloader_num_workers: 8
+  gradient_accumulation_steps: 4
+  cond_mask_prob: -1
+  ema:
+    enabled: false
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+
+optimizer:
+  learning_rate: 1.0e-5
+  lr:
+    scheduler: constant
+    warmup_steps: 0
+
+logging:
+  report_to: wandb
+  resume_from_checkpoint: null
+
+runtime:
+  mixed_precision: bf16
+  load_from_hdf5: true
+  gradient_checkpointing: true
+  image_aug: false
+  train_runner_module: runner_video
+  train_runner_class: VideoRunner
+  video_sample_guidance: 1.0
+
+distributed:
+  deepspeed: off
+
+inference: {}

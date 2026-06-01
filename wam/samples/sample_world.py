@@ -4,12 +4,11 @@ from typing import Any, Dict, Iterator, Optional
 
 import torch
 import torch.nn.functional as F
-import imageio
 import os
-import numpy as np
 from accelerate.utils import broadcast_object_list
 
-from wam.samples.quick_metrics import compute_video_l1_psnr_ssim, latent_l1
+from wam.samples.quick_metrics import latent_l1
+from wam.samples.video_report import finalize_video_metrics, report_decoded_video_pair
 
 
 def value_to_value_frame(value: torch.Tensor, noisy_video: torch.Tensor) -> torch.Tensor:
@@ -142,6 +141,8 @@ def log_sample_res(
     distributed_reduce: bool = True,
     sample_light: bool = False,
     sample_sharded_inference: bool = False,
+    compute_video_metrics: Optional[bool] = None,
+    save_video: Optional[bool] = None,
 ):
     """
     Evaluate model performance on validation set and log metrics during training.
@@ -191,8 +192,12 @@ def log_sample_res(
         model.eval()
 
         # 训练期轻量采样：只做 action-only 一次，避免 causal 下 AE+联合 两次 6B 推理 + VAE 解码 OOM。
-        save_sample_video = bool(getattr(args, "sample_save_video", False))
-        sample_compute_video_metrics = bool(getattr(args, "sample_compute_video_metrics", False))
+        save_sample_video = bool(getattr(args, "sample_save_video", False)) if save_video is None else bool(save_video)
+        sample_compute_video_metrics = (
+            bool(getattr(args, "sample_compute_video_metrics", False))
+            if compute_video_metrics is None
+            else bool(compute_video_metrics)
+        )
         sample_joint_only = bool(getattr(args, "sample_joint_only", False))
         if sample_joint_only:
             predict_runs = [(False, "")]
@@ -344,27 +349,30 @@ def log_sample_res(
                     n_frames = min(video_orig.shape[0], video_pred.shape[0])
                     video_orig = video_orig[:n_frames]
                     video_pred = video_pred[:n_frames]
-                    if can_decode_video_metrics:
-                        metric_reduce = distributed_reduce and not sample_sharded_inference
-                        video_metrics = compute_video_l1_psnr_ssim(video_pred, video_orig)
-                        for metric_name, metric_value in video_metrics.items():
-                            metric_scaler = _reduce_metric(
-                                accelerator,
-                                metric_value.to(accelerator.device),
-                                distributed_reduce=metric_reduce,
-                            )
-                            loss_for_log[
-                                log_key_prefix + "overall_avg_sample_" + metric_name
-                            ] += metric_scaler
-                    if decoded_for_export:
-                        video_concat = np.concatenate([video_orig, video_pred], axis=2)
-                        video_name = f"output_video_rank{rank_id}_case{step}.mp4"
-                        imageio.mimsave(
-                            os.path.join(sample_save_path, video_name),
-                            video_concat,
-                            fps=max(1, n_frames // 5),
-                            codec="libx264",
+                    metric_reduce = distributed_reduce and not sample_sharded_inference
+                    video_metrics = report_decoded_video_pair(
+                        gt_video=video_orig,
+                        pred_video=video_pred,
+                        sample_save_path=sample_save_path,
+                        filename_prefix=f"output_video_rank{rank_id}_case{step}",
+                        compute_metrics=can_decode_video_metrics,
+                        save_video=(
+                            decoded_for_export
+                            and rank_id < int(getattr(args, "sample_video_max_rank", 16))
+                        ),
+                        reverse_video_order=bool(getattr(args, "reverse_video_order", False)),
+                        save_forward_view=bool(getattr(args, "sample_save_forward_view", True)),
+                        fps=max(1, n_frames // 5),
+                    )
+                    for metric_name, metric_value in video_metrics.items():
+                        metric_scaler = _reduce_metric(
+                            accelerator,
+                            metric_value.to(accelerator.device),
+                            distributed_reduce=metric_reduce,
                         )
+                        loss_for_log[
+                            log_key_prefix + "overall_avg_sample_" + metric_name
+                        ] += metric_scaler
                 elif export_joint and not save_sample_video:
                     _save_joint_sample_latents(
                         sample_save_path,
@@ -437,6 +445,8 @@ def log_sample_res(
         for vk in value_loss_keys:
             if vk in loss_for_log:
                 loss_for_log[vk] = round(loss_for_log[vk] / (args.num_sample_batches), 4)
+        prefixes = ("AE_", "") if action_only else ("",)
+        finalize_video_metrics(loss_for_log, args.num_sample_batches, prefixes=prefixes)
 
 
         model.train()

@@ -337,6 +337,41 @@ def parse_args(input_args=None):
         help="Training-time sampling 是否 VAE decode 计算 video L1/PSNR/SSIM。默认 false，避免 sample 阶段解码 OOM。",
     )
     parser.add_argument(
+        "--sample-video-metric-period",
+        type=int,
+        default=-1,
+        dest="sample_video_metric_period",
+        help="每多少个 global step 运行视频 PSNR/SSIM 等指标；-1 表示沿用 sample_period。",
+    )
+    parser.add_argument(
+        "--sample-video-visual-period",
+        type=int,
+        default=-1,
+        dest="sample_video_visual_period",
+        help="每多少个 global step 保存视频可视化；-1 表示沿用 sample_period。",
+    )
+    parser.add_argument(
+        "--sample-video-visual-on-step0",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="sample_video_visual_on_step0",
+        help="是否在第一次训练采样时额外保存视频可视化。",
+    )
+    parser.add_argument(
+        "--sample-save-forward-view",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="sample_save_forward_view",
+        help="reverse_video_order=true 时，除逆序对比外额外保存翻回正序的 GT/PRED 对比视频。",
+    )
+    parser.add_argument(
+        "--sample-video-max-rank",
+        type=int,
+        default=16,
+        dest="sample_video_max_rank",
+        help="训练期采样最多保存多少个 rank 的视频可视化。",
+    )
+    parser.add_argument(
         "--sample-joint-only",
         action=argparse.BooleanOptionalAction,
         default=False,

@@ -50,6 +50,28 @@ if is_wandb_available():
     import wandb
 
 
+def _resolve_sample_period(args, attr_name: str) -> int:
+    period = int(getattr(args, attr_name, -1))
+    if period < 0:
+        period = int(getattr(args, "sample_period", -1))
+    return period
+
+
+def _should_run_periodic(global_step: int, period: int) -> bool:
+    return period > 0 and global_step % period == 0
+
+
+def _should_save_video_visual(args, global_step: int, period: int) -> bool:
+    first_sample = bool(getattr(args, "sample_video_visual_on_step0", True)) and global_step == 1
+    return first_sample or _should_run_periodic(global_step, period)
+
+
+def _maybe_reverse_video(video: torch.Tensor, args) -> torch.Tensor:
+    if bool(getattr(args, "reverse_video_order", False)):
+        return torch.flip(video, dims=[1])
+    return video
+
+
 def save_model_card(repo_id: str, base_model: str, repo_folder=None):
     yaml_front = f"""
 ---
@@ -122,6 +144,7 @@ def train(args, logger):
         )
 
     config = load_model_structure_dict(model_config)
+    args.reverse_video_order = bool(config.get("dataset", {}).get("reverse_video_order", False))
     vbm = model_config.get("VIDEO_BASE_MODEL")
     if vbm is not None and str(vbm).strip() != "" and str(vbm).strip().lower() not in ("none", "null"):
         m = config.setdefault("model", {})
@@ -412,7 +435,7 @@ def train(args, logger):
         video_model.train()
         for batch in train_dataloader:
             with accelerator.accumulate(video_model):
-                video = batch["video"]
+                video = _maybe_reverse_video(batch["video"], args)
                 with torch.no_grad():
                     video = video.transpose(1, 2).to(dtype=weight_dtype)
                     video_latents = vae.encode_to_latents(video, vae_mini_batch=vae_mini_batch)
@@ -462,7 +485,17 @@ def train(args, logger):
                         )
                     accelerator.wait_for_everyone()
 
-                if args.sample_period > 0 and global_step % args.sample_period == 0:
+                metric_period = _resolve_sample_period(args, "sample_video_metric_period")
+                visual_period = _resolve_sample_period(args, "sample_video_visual_period")
+                run_video_metrics = (
+                    bool(getattr(args, "sample_compute_video_metrics", True))
+                    and _should_run_periodic(global_step, metric_period)
+                )
+                run_video_visual = (
+                    bool(getattr(args, "sample_save_video", False))
+                    and _should_save_video_visual(args, global_step, visual_period)
+                )
+                if run_video_metrics or run_video_visual:
                     sample_save_path = os.path.join(args.output_dir, "sample", f"step-{global_step}")
                     os.makedirs(sample_save_path, exist_ok=True)
                     sample_loss_for_log = log_sample_res(
@@ -475,6 +508,8 @@ def train(args, logger):
                         sample_dataloader,
                         logger,
                         sample_save_path,
+                        compute_video_metrics=run_video_metrics,
+                        save_video=run_video_visual,
                     )
                     logger.info(sample_loss_for_log)
                     accelerator.log(sample_loss_for_log, step=global_step)
