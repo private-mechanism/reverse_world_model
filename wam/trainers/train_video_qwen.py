@@ -584,7 +584,8 @@ def train(args, logger):
                 )
                 if run_video_metrics or run_video_visual:
                     sample_save_path = os.path.join(args.output_dir, "sample", f"step-{global_step}")
-                    os.makedirs(sample_save_path, exist_ok=True)
+                    if run_video_visual:
+                        os.makedirs(sample_save_path, exist_ok=True)
                     sample_loss_for_log = log_sample_res(
                         vae,
                         qwen_encoder,

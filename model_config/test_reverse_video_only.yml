@@ -57,9 +57,9 @@ checkpoints:
   root_dir: /mnt/world_foundational_model/fyzhao/reverse_world_model/checkpoints/
 
 weights:
-  video_base_model: /mnt/dataset/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
-  text_encoder: /mnt/dataset/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
-  vision_encoder: /mnt/dataset/datasets/cjt_personal/pretrained_models/siglip2-so400m-patch14-384
+  video_base_model: /mnt/damoxing/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
+  text_encoder: /mnt/damoxing/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
+  vision_encoder: /mnt/damoxing/datasets/cjt_personal/pretrained_models/siglip2-so400m-patch14-384
   video_expert: none
 
 training:

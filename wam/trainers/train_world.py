@@ -257,7 +257,8 @@ def run_training_sample_logging(
     else:
         distributed_reduce = accelerator.num_processes > 1
     if accelerator.is_main_process:
-        os.makedirs(sample_save_path, exist_ok=True)
+        if save_video:
+            os.makedirs(sample_save_path, exist_ok=True)
         if sample_sharded_inference:
             logger.info(
                 "ZeRO sharded sampling: %s rank(s), %s collective batch step(s) "
