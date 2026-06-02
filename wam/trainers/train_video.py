@@ -72,6 +72,44 @@ def _maybe_reverse_video(video: torch.Tensor, args) -> torch.Tensor:
     return video
 
 
+def _resume_video_training_if_requested(
+    args,
+    accelerator: Accelerator,
+    logger,
+    *,
+    output_dir: str,
+    num_update_steps_per_epoch: int,
+    ema_model: EMAModel | None = None,
+) -> tuple[int, int]:
+    if not getattr(args, "resume_from_checkpoint", None):
+        return 0, 0
+
+    if args.resume_from_checkpoint != "latest":
+        checkpoint_name = os.path.basename(args.resume_from_checkpoint)
+    else:
+        checkpoint_dirs = []
+        if os.path.isdir(output_dir):
+            checkpoint_dirs = [name for name in os.listdir(output_dir) if name.startswith("checkpoint-")]
+            checkpoint_dirs = sorted(checkpoint_dirs, key=lambda name: int(name.split("-")[1]))
+        checkpoint_name = checkpoint_dirs[-1] if checkpoint_dirs else None
+
+    if checkpoint_name is None:
+        accelerator.print(
+            f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+        )
+        args.resume_from_checkpoint = None
+        return 0, 0
+
+    checkpoint_dir = os.path.join(output_dir, checkpoint_name)
+    accelerator.print(f"Resuming from checkpoint {checkpoint_name}")
+    accelerator.load_state(checkpoint_dir)
+    global_step = int(checkpoint_name.split("-")[1])
+    if ema_model is not None:
+        ema_model.optimization_step = global_step
+        logger.info("EMA optimization_step restored to %s.", global_step)
+    return global_step, global_step // num_update_steps_per_epoch
+
+
 def save_model_card(repo_id: str, base_model: str, repo_folder=None):
     yaml_front = f"""
 ---
@@ -423,6 +461,14 @@ def train(args, logger):
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
+    global_step, first_epoch = _resume_video_training_if_requested(
+        args,
+        accelerator,
+        logger,
+        output_dir=args.output_dir,
+        num_update_steps_per_epoch=num_update_steps_per_epoch,
+        ema_model=ema_model,
+    )
 
     progress_bar = tqdm(
         total=args.max_train_steps,
