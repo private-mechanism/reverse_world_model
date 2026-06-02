@@ -1,0 +1,492 @@
+# Reverse WVWAM / CoA-Inspired Research Plan
+
+This plan describes a staged path from the current reverse video-only experiment to a CoA-inspired WVWAM system where both video and action generation use reverse-time reasoning anchored by predicted keyframes / key actions.
+
+Core principle:
+
+The goal is not only to flip trajectories. The model should first predict a keyframe anchor, then generate the local trajectory backward from that anchor, and finally reverse the generated sequence back to forward order for execution or visualization.
+
+
+## Stage 1: Fixed Horizon + GT Keyframe Oracle
+
+### Scheme Overview
+
+Use the current fixed horizon setting. For each training sub-trajectory, take the terminal frame/action as the keyframe anchor:
+
+- `video_forward = x_t, ..., x_{t+H}`
+- `video_reverse = x_{t+H}, ..., x_t`
+- `action_forward = a_t, ..., a_{t+H-1}`
+- `action_reverse = a_{t+H-1}, ..., a_t`
+
+The model uses ground-truth terminal information as the oracle condition. This isolates whether reverse video/action dynamics are learnable before we ask the model to predict the keyframe itself.
+
+### Scheme Details
+
+For the current config:
+
+- `action_chunk_size = 32`
+- `sample_video_fps = 1`
+- each sub-trajectory contains 32 action steps and 33 video frames.
+
+Training targets:
+
+- Video condition: GT `x_{t+H}`
+- Video target: `x_{t+H} -> x_t`
+- Action condition: GT terminal action/state, if explicitly modeled
+- Action target: `a_{t+H-1} -> a_t`
+
+This is an oracle setting because `x_{t+H}` and terminal action/state come from the dataset.
+
+### Validation Goal
+
+Verify that backward dynamics are learnable under oracle terminal conditions:
+
+- Can the video expert generate coherent `x_{t+H} -> x_t`?
+- Can the action expert learn reverse action targets?
+- Does reverse WVWAM remain stable when both video and action are reversed?
+
+### Engineering Implementation
+
+Modify the world training path:
+
+- In `wam/trainers/world_train_module.py`, add a `reverse_world_order` branch.
+- Flip `batch["video"]` on time dimension when enabled.
+- Flip `batch["actions"]` on time dimension when enabled.
+- Keep the current diffusion loss unchanged.
+- Ensure sampling/evaluation uses the same ordering as training.
+- Save both reverse comparison and forward-view visualizations.
+
+Suggested config fields:
+
+```yaml
+training:
+  reverse_world_order: true
+  sample_save_forward_view: true
+```
+
+### Validation Plan
+
+- Run a small smoke test, e.g. 100-500 steps.
+- Check `loss_v` and `loss_a` for normal behavior.
+- Track video metrics: PSNR, SSIM, video L1.
+- Track action metrics: action L1/MSE after reversing prediction back to forward order.
+- Compare:
+  - `reverse_world_order=false`
+  - `reverse_world_order=true`
+- Inspect:
+  - reverse-view GT vs Pred
+  - forward-view GT vs Pred
+
+
+## Stage 2: Add Keyframe / Key Action Prediction
+
+### Scheme Overview
+
+Keep reverse generation conditioned on GT keyframes for now, but add explicit key prediction losses. The model learns:
+
+- `O_t -> x_{t+H}`
+- `O_t -> a_key` or `s_{t+H}`
+
+This stage decouples key prediction quality from reverse generation quality.
+
+### Scheme Details
+
+Add auxiliary prediction targets:
+
+- `key_video_gt = VAE(x_{t+H})` or RGB terminal frame
+- `key_action_gt = a_{t+H-1}`
+- optionally `key_state_gt = s_{t+H}` if available from the dataset
+
+Total loss:
+
+```text
+loss = loss_reverse_video
+     + loss_reverse_action
+     + lambda_video_key * loss_key_video
+     + lambda_action_key * loss_key_action
+```
+
+For a first implementation, key video prediction can be supervised in latent space to avoid expensive RGB-space modeling.
+
+### Validation Goal
+
+Verify that the model can predict a usable future anchor from the current observation:
+
+- Is predicted `x_{t+H}` visually close to GT?
+- Is predicted key action/state numerically close to GT?
+- Does key prediction improve over training?
+
+### Engineering Implementation
+
+Dataset / train module:
+
+- Expose `key_video_frame = video[:, -1]`.
+- Expose `key_action = actions[:, -1]`.
+- If available, expose `key_state = qpos/state at t+H`.
+
+Runner/model:
+
+- Add `pred_key_video`.
+- Add `pred_key_action` or `pred_key_state`.
+- Add key losses in `compute_loss`.
+
+Suggested config fields:
+
+```yaml
+training:
+  train_key_video: true
+  train_key_action: true
+  key_loss_weight_video: 1.0
+  key_loss_weight_action: 1.0
+```
+
+### Validation Plan
+
+- Log key video latent L1/MSE.
+- Decode predicted key video and compare with GT `x_{t+H}`.
+- Log key action/state L1/MSE.
+- Separately inspect gripper dimensions and major joint dimensions.
+- Keep reverse generation conditioned on GT keyframes during this stage.
+
+
+## Stage 3: Predicted Key Scheduled Sampling
+
+### Scheme Overview
+
+Gradually replace GT keyframe/action conditions with model-predicted keyframe/action conditions during training.
+
+Early training uses GT anchors. Later training uses predicted anchors more often.
+
+### Scheme Details
+
+Use a probability schedule:
+
+```text
+p_pred_key = schedule(global_step)
+```
+
+Examples:
+
+- early: `p_pred_key = 0.0`
+- middle: `p_pred_key = 0.25` or `0.5`
+- late: `p_pred_key = 0.75` or `1.0`
+
+Video condition:
+
+```text
+condition_video = GT x_{t+H} or predicted x_{t+H}
+```
+
+Action condition:
+
+```text
+condition_action/state = GT key or predicted key
+```
+
+Initially, predicted keys can be detached before feeding them into reverse generation. Later, test end-to-end gradients.
+
+### Validation Goal
+
+Verify whether predicted keyframes/actions can serve as stable reverse-generation anchors.
+
+Important questions:
+
+- How much does reverse generation degrade when using predicted keys?
+- Does scheduled sampling reduce the train/test mismatch?
+- Is key prediction error strongly correlated with rollout error?
+
+### Engineering Implementation
+
+Add a key condition mode:
+
+```yaml
+training:
+  key_condition_mode: scheduled  # gt | pred | scheduled
+  pred_key_prob: 0.5
+  detach_pred_key_condition: true
+```
+
+Implementation points:
+
+- In the train module or runner, choose GT vs predicted key per batch/sample.
+- Feed selected key into video/action reverse condition.
+- Start with `detach_pred_key_condition=true`.
+- Later test end-to-end key conditioning.
+
+### Validation Plan
+
+Compare three conditions:
+
+- GT key oracle
+- predicted key, detached
+- predicted key, end-to-end
+
+Track:
+
+- video PSNR/SSIM/L1
+- action L1/MSE
+- key prediction error
+- rollout error conditioned on predicted key
+
+Inspect whether predicted-key forward-view videos drift away from the intended task goal.
+
+
+## Stage 4: CoA-Style Semantic Keypoint / Variable-Length Subtrajectory
+
+### Scheme Overview
+
+Replace fixed horizon keyframes with CoA-style semantic keypoints. Instead of always using `t+32`, select the next meaningful task-stage boundary as the keyframe.
+
+Candidate keypoint rules:
+
+- gripper state changes
+- joint/action velocity approaches zero
+- episode end
+
+### Scheme Details
+
+For each episode:
+
+1. Randomly choose `t_start`.
+2. Find the next keypoint `t_key`.
+3. Construct a sub-trajectory:
+
+```text
+video:  x_{t_start}, ..., x_{t_key}
+action: a_{t_start}, ..., a_{t_key-1}
+```
+
+Reverse targets:
+
+```text
+video_reverse:  x_{t_key}, ..., x_{t_start}
+action_reverse: a_{t_key-1}, ..., a_{t_start}
+```
+
+Variable-length handling:
+
+- Pad shorter trajectories.
+- Use masks for padded video/action positions.
+- Skip or truncate trajectories longer than a configured max length.
+
+### Validation Goal
+
+Test whether semantic anchors are better than fixed horizon anchors:
+
+- Do they improve key prediction?
+- Do they make reverse generation easier?
+- Do they align better with task stages such as grasp/release/place?
+
+### Engineering Implementation
+
+Add keypoint discovery to the dataset:
+
+- Use `observations/qpos` and `action` from RoboTwin HDF5.
+- Detect gripper changes.
+- Detect near-zero joint/action velocity.
+- Always include episode end as a fallback keypoint.
+
+Suggested config fields:
+
+```yaml
+data:
+  dataset:
+    subtrajectory_mode: semantic_keypoint  # fixed_horizon | semantic_keypoint
+    keypoint_velocity_threshold: 0.01
+    max_subtrajectory_len: 64
+```
+
+Dataset should return:
+
+- `subtraj_len`
+- `keypoint_type`
+- `valid_action_mask`
+- `valid_video_mask`
+- `key_video_frame`
+- `key_action`
+- optionally `key_state`
+
+Loss functions must apply masks.
+
+### Validation Plan
+
+First run dataset-level analysis:
+
+- number of keypoints per episode
+- subtrajectory length distribution
+- keypoint type distribution
+- examples of extracted keypoint segments
+
+Then compare:
+
+- fixed horizon + GT key
+- semantic keypoint + GT key
+- fixed horizon + predicted key
+- semantic keypoint + predicted key
+
+Metrics:
+
+- key video/action error
+- video PSNR/SSIM/L1
+- action L1/MSE
+- qualitative task-stage consistency
+
+
+## Stage 5: Action Expert CoA-Style Autoregressive Reverse Decoder
+
+### Scheme Overview
+
+This is the closest version to CoA. The action expert no longer only denoises a full reversed action chunk. Instead, it autoregressively generates reversed continuous action tokens:
+
+```text
+SOS -> key action
+SOS + key action -> previous action
+SOS + key action + previous action -> earlier action
+```
+
+After generation, reverse the predicted sequence back to forward order for execution.
+
+### Scheme Details
+
+Given forward actions:
+
+```text
+a_1, ..., a_T
+```
+
+Encode:
+
+```text
+x_i = action_encoder(a_i)
+```
+
+Reverse:
+
+```text
+x_rev = x_T, ..., x_1
+```
+
+Decoder input:
+
+```text
+SOS, x_T, ..., x_2
+```
+
+Target:
+
+```text
+x_T, ..., x_1
+```
+
+Loss:
+
+```text
+L_reg = || action_decoder(x_hat_rev) - action_rev ||
+L_latent = || x_hat_rev - action_encoder(action_rev) ||
+L_total = L_reg + lambda * L_latent
+```
+
+Optional MTP:
+
+At each reverse decoding step, predict the next `K` reversed tokens for local continuity. Use MTP only during training.
+
+### Validation Goal
+
+Test whether CoA-style global-to-local action generation outperforms diffusion reverse action generation:
+
+- better action smoothness
+- better long-horizon stability
+- better spatial generalization
+- lower closed-loop correction burden
+
+### Engineering Implementation
+
+In `wam/models/mvwam/action_expert.py`, add an AR action mode:
+
+```yaml
+architecture:
+  model:
+    action_generation_mode: reverse_ar  # diffusion | reverse_ar
+```
+
+Potential components:
+
+- `sos_action_token`
+- causal decoder path
+- latent output before action decoding
+- reuse existing `action_encoder`
+- reuse existing `action_decoder`
+- add latent consistency loss
+- optional MTP heads
+
+Runner additions:
+
+- `compute_loss_reverse_ar_action`
+- `predict_action_reverse_ar`
+
+Inference:
+
+```text
+H = [SOS]
+while not stop:
+    x_hat = decoder(H | observation)
+    H.append(x_hat)
+    a_hat = action_decoder(x_hat)
+    if distance(a_hat, current_state) < threshold:
+        break
+
+actions_reverse = decode(H[1:])
+actions_forward = reverse(actions_reverse)
+```
+
+Dynamic stop:
+
+- For joint-space RoboTwin, use distance between decoded action/state and current qpos.
+- Include gripper consistency if useful.
+
+### Validation Plan
+
+Offline:
+
+- action L1/MSE
+- latent consistency loss
+- dynamic stop length distribution
+- trajectory smoothness
+
+Compare:
+
+- diffusion forward action
+- diffusion reverse action
+- AR reverse action
+- fixed horizon vs semantic keypoint
+- GT key vs predicted key
+
+Online/closed-loop:
+
+- Generate a segment.
+- Execute the first few actions.
+- Re-observe.
+- Replan.
+
+Optional:
+
+- reverse temporal ensemble to smooth overlapping predicted trajectories.
+
+
+## Recommended Implementation Order
+
+1. Stage 1: oracle reverse WVWAM.
+2. Stage 2: key video/action prediction.
+3. Stage 3: predicted key conditioning via scheduled sampling.
+4. Stage 4: semantic keypoint extraction and variable-length sub-trajectories.
+5. Stage 5: CoA-style autoregressive reverse action decoder.
+
+Do not start with Stage 5. It changes the action expert training paradigm. First prove:
+
+```text
+GT key reverse generation works.
+Predicted key quality is acceptable.
+Predicted key reverse generation works.
+```
+
+Then upgrade action generation from diffusion reverse chunking to CoA-style autoregressive reverse decoding.

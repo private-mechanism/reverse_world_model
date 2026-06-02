@@ -201,6 +201,7 @@ def flatten_model_config_v2(raw: Dict[str, Any]) -> Dict[str, Any]:
         ("sample_save_video", "sample_save_video"),
         ("sample_compute_video_metrics", "sample_compute_video_metrics"),
         ("sample_sharded_inference", "sample_sharded_inference"),
+        ("reverse_world_order", "reverse_world_order"),
         ("checkpoints_total_limit", "checkpoints_total_limit"),
         ("dataloader_num_workers", "dataloader_num_workers"),
         ("gradient_accumulation_steps", "gradient_accumulation_steps"),

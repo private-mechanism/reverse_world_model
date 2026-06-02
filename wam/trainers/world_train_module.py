@@ -13,6 +13,13 @@ import torch
 import torch.nn as nn
 
 
+def maybe_reverse_world_batch(video: torch.Tensor, actions: torch.Tensor, args) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reverse video/action targets for oracle reverse WVWAM experiments."""
+    if not bool(getattr(args, "reverse_world_order", False)):
+        return video, actions
+    return torch.flip(video, dims=[1]), torch.flip(actions, dims=[1])
+
+
 class TrainModule:
     """持有可训练 model（当前为 ``FMPRunner``），提供 ``training_step``。"""
 
@@ -37,6 +44,7 @@ class TrainModule:
         images = batch["images"]
         states = batch["states"][:, -1:, :]
         actions = batch["actions"]
+        video, actions = maybe_reverse_world_batch(video, actions, args)
         value = batch.get("value", None)
         state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
         ctrl_freqs = batch["ctrl_freqs"]

@@ -365,6 +365,13 @@ def parse_args(input_args=None):
         help="reverse_video_order=true 时，除逆序对比外额外保存翻回正序的 GT/PRED 对比视频。",
     )
     parser.add_argument(
+        "--reverse-world-order",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        dest="reverse_world_order",
+        help="WVWAM 训练/采样时将 video 与 action 目标同时按时间维翻转，用于第一阶段 oracle reverse world 实验。",
+    )
+    parser.add_argument(
         "--sample-video-max-rank",
         type=int,
         default=16,

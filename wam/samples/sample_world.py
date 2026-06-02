@@ -124,6 +124,10 @@ def _reduce_metric(accelerator, value: torch.Tensor, *, distributed_reduce: bool
     return accelerator.gather(value).mean().item()
 
 
+def _reverse_world_order_enabled(args) -> bool:
+    return bool(getattr(args, "reverse_world_order", False))
+
+
 @torch.no_grad()
 def log_sample_res(
     vae,
@@ -253,6 +257,11 @@ def log_sample_res(
             # We only use the last state as input
             states = states[:, -1:, :]
             actions = batch["actions"].to(dtype=weight_dtype)
+            reverse_world_order = _reverse_world_order_enabled(args)
+            if reverse_world_order:
+                actions = torch.flip(actions, dims=[1])
+                if video is not None:
+                    video = torch.flip(video, dims=[1])
             state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
 
             vae_mini_batch = int(getattr(args, "vae_mini_batch", 1))
@@ -360,7 +369,7 @@ def log_sample_res(
                             decoded_for_export
                             and rank_id < int(getattr(args, "sample_video_max_rank", 16))
                         ),
-                        reverse_video_order=bool(getattr(args, "reverse_video_order", False)),
+                        reverse_video_order=reverse_world_order,
                         save_forward_view=bool(getattr(args, "sample_save_forward_view", True)),
                         fps=max(1, n_frames // 5),
                     )

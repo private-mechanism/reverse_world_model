@@ -482,6 +482,11 @@ def train(args, logger):
 
     model_structure = load_model_structure_dict(model_config)
     args.reverse_video_order = bool(model_structure.get("dataset", {}).get("reverse_video_order", False))
+    args.reverse_world_order = bool(
+        getattr(args, "reverse_world_order", False) or model_config.get("reverse_world_order", False)
+    )
+    if args.reverse_world_order:
+        args.reverse_video_order = True
     video_base_model_name = model_config.get("VIDEO_BASE_MODEL")
     if (
         video_base_model_name is not None
@@ -975,6 +980,11 @@ def train(args, logger):
             "(ZeRO: same batch + sharded weights; EMA sampling forces non-sharded).",
             sample_light,
             sample_sharded_inference,
+        )
+    if accelerator.is_main_process and args.reverse_world_order:
+        logger.info(
+            "reverse_world_order=true: world training/sampling flips video and action targets in time "
+            "(oracle fixed-horizon reverse WVWAM stage)."
         )
 
     extra_log_metrics = {}
