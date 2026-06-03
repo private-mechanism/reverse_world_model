@@ -1,13 +1,13 @@
 # =============================================================================
-# Stage 1 validation: semantic-keypoint oracle reverse WVWAM.
+# Stage 1 validation: fixed-horizon oracle reverse WVWAM.
 #
 # Goal:
 #   Verify that WVWAM can learn reverse-time video/action targets when the
-#   terminal video frame is still provided by the GT semantic-keypoint clip.
+#   terminal video frame is still provided by the GT fixed-horizon clip.
 #
 # What this enables:
-#   - subtrajectory_mode=semantic_keypoint samples start -> next CoA-style keypoint.
-#   - reverse_world_order=true flips valid video/action targets in world training.
+#   - subtrajectory_mode=fixed_horizon samples length-32 action chunks.
+#   - reverse_world_order=true flips video/action targets in world training.
 #   - video/action metrics are computed in the same reverse target view.
 #   - forward_view videos are also saved for human inspection.
 # =============================================================================
@@ -53,12 +53,7 @@ data:
     sample_video_fps: 1
     video_size: [384, 320]
     num_cameras: 3
-    subtrajectory_mode: semantic_keypoint
-    min_subtrajectory_len: 4
-    max_subtrajectory_len: 32
-    keypoint_min_gap: 5
-    keypoint_velocity_threshold: 0.01
-    keypoint_gripper_threshold: 0.1
+    subtrajectory_mode: fixed_horizon
 
 architecture:
   model:

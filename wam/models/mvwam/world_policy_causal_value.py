@@ -697,7 +697,10 @@ class WorldPolicyModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalMo
                     hidden_states_video = outputs[output_index]
                     output_index += 1
                 if hidden_states_action is not None and layer_idx < num_action_layers:
-                    hidden_states_action = outputs[output_index]
+                    if hidden_states_video is None and isinstance(outputs, tuple) and len(outputs) >= 2:
+                        hidden_states_action = outputs[1]
+                    else:
+                        hidden_states_action = outputs[output_index]
             elif (
                 hidden_states_action is not None
                 and self.action_expert is not None
