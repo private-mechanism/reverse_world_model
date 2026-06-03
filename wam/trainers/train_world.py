@@ -1067,6 +1067,14 @@ def train(args, logger):
                     "loss_v": loss_video.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                 }
+                stage2_metrics = getattr(train_module.model, "last_stage2_metrics", None)
+                if stage2_metrics:
+                    logs.update(
+                        {
+                            key: value.detach().item() if torch.is_tensor(value) else float(value)
+                            for key, value in stage2_metrics.items()
+                        }
+                    )
                 if loss_value is not None:
                     logs.update({"loss_value": loss_value.detach().item()})
                 progress_bar.set_postfix(**logs)

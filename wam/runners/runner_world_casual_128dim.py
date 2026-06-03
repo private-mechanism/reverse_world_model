@@ -19,7 +19,7 @@ from wam.runners.runner_video import (
 )
 
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, UniPCMultistepScheduler, DDPMScheduler, DPMSolverMultistepScheduler
-from typing import Optional
+from typing import Optional, Tuple
 
 # 获取当前文件的绝对路径（包含文件名）
 current_file_path = os.path.abspath(__file__)
@@ -160,6 +160,12 @@ class FMPRunner(nn.Module,
         self.action_dim = config['action_expert']['out_action_dim']
         self.state_token_dim = config['state_token_dim']
         self.video_pred_horizon = pred_horizon // sample_fps
+        self.stage2_enable_reverse_ar_action = bool(config.get("stage2_enable_reverse_ar_action", False))
+        self.stage2_key_action_loss_weight = float(config.get("stage2_key_action_loss_weight", 0.0))
+        self.stage2_reverse_ar_action_loss_weight = float(
+            config.get("stage2_reverse_ar_action_loss_weight", 0.0)
+        )
+        self.last_stage2_metrics = {}
 
         print("FMPRunner params: %e" %
               sum([p.numel() for p in self.model.parameters()]))
@@ -711,9 +717,75 @@ class FMPRunner(nn.Module,
             "pred_value": noisy_value if self.use_value else None,
         }
 
+    def _masked_mse(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if valid_mask is None:
+            return F.mse_loss(pred, target)
+        valid = valid_mask.to(device=pred.device, dtype=pred.dtype).unsqueeze(-1)
+        loss_elem = F.mse_loss(pred, target, reduction="none")
+        denom = valid.expand_as(loss_elem).sum().clamp_min(1.0)
+        return (loss_elem * valid).sum() / denom
+
+    def _compute_stage2_reverse_ar_action_loss(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        img_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        action_gt: torch.Tensor,
+        action_mask: torch.Tensor,
+        action_valid_mask: Optional[torch.Tensor],
+        video_kv_mask_mode: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Teacher-forced CoA-style reverse action loss.
+
+        ``action_gt`` is already in the training view. With ``reverse_world_order=true``,
+        token 0 is the semantic key action. The decoder input is shifted right with an
+        all-zero SOS action token; causal action attention can then learn
+        ``SOS -> key action -> previous action -> ...``.
+        """
+        batch_size, horizon, _ = action_gt.shape
+        sos = torch.zeros_like(action_gt[:, :1])
+        shifted_action = torch.cat([sos, action_gt[:, :-1]], dim=1)
+        action_mask_expanded = action_mask.expand(-1, horizon, -1)
+        timestep_action = torch.zeros(batch_size, device=action_gt.device, dtype=torch.long)
+        ar_value = None
+        if self.use_value:
+            zero_value = torch.zeros_like(action_gt[:, :1])
+            ar_value = torch.cat([zero_value, action_mask], dim=2)
+
+        pred_video_unused, pred_action_ar = self.model(
+            hidden_states_video=None,
+            hidden_states_action=torch.cat([shifted_action, action_mask_expanded], dim=2).to(self.dtype),
+            hidden_states_robostate=torch.cat([state_tokens, action_mask], dim=2).to(self.dtype),
+            hidden_states_visual=img_tokens.to(self.dtype),
+            timestep_action=timestep_action,
+            timestep_video=None,
+            encoder_hidden_states=lang_tokens.to(self.dtype),
+            value=ar_value.to(self.dtype) if ar_value is not None else None,
+            video_kv_mask_mode=video_kv_mask_mode,
+            return_dict=False,
+        )
+        del pred_video_unused
+        pred_action_ar = pred_action_ar[:, :horizon].to(action_gt.dtype)
+        target_action = action_gt.to(pred_action_ar.dtype)
+        reverse_ar_loss = self._masked_mse(pred_action_ar, target_action, action_valid_mask)
+        key_valid_mask = (
+            action_valid_mask[:, :1]
+            if action_valid_mask is not None
+            else None
+        )
+        key_action_loss = self._masked_mse(pred_action_ar[:, :1], target_action[:, :1], key_valid_mask)
+        return key_action_loss, reverse_ar_loss
+
     # ========= Train  ============
     def compute_loss(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens, action_gt, action_mask,
                      ctrl_freqs, video_latents, condition_video_latents, value=None,
+                     action_valid_mask: Optional[torch.Tensor] = None,
                      video_kv_mask_mode: str = "random") -> torch.Tensor:
         '''
         lang_tokens: (batch_size, lang_len, lang_token_dim)
@@ -729,6 +801,9 @@ class FMPRunner(nn.Module,
         '''
         batch_size = lang_tokens.shape[0]
         device = lang_tokens.device
+        self.last_stage2_metrics = {}
+        stage2_action_gt = action_gt
+        stage2_action_valid_mask = action_valid_mask
 
         # Sample noise that we'll add to the actions
         noise_for_action = torch.randn(action_gt.shape, dtype=action_gt.dtype, device=device)
@@ -773,6 +848,9 @@ class FMPRunner(nn.Module,
             target_value = (noise_for_value - value).to(self.dtype)
             noise_for_action = torch.cat([noise_for_action, noise_for_value], dim=1)
             action_gt = torch.cat([action_gt, value], dim=1)
+            if action_valid_mask is not None:
+                value_valid_mask = action_valid_mask.new_ones(action_valid_mask.shape[0], 1)
+                action_valid_mask = torch.cat([action_valid_mask, value_valid_mask], dim=1)
         target_action = (noise_for_action - action_gt).to(self.dtype) #/ sigmas_for_action.unsqueeze(-1).unsqueeze(-1)).to(self.dtype)
         target_video = (noise_for_video - video_latents).to(self.dtype)
         if self.noise_scheduler_type != "ddpm":
@@ -790,7 +868,10 @@ class FMPRunner(nn.Module,
                 v_pred = (pred_action - action_gt).to(self.dtype)
                 if self.use_value:
                     v_pred_value = (pred_value.detach() - value).to(self.dtype)
-            loss_action = F.mse_loss(v_pred, target_action)
+            if action_valid_mask is not None:
+                loss_action = self._masked_mse(v_pred, target_action, action_valid_mask)
+            else:
+                loss_action = F.mse_loss(v_pred, target_action)
             loss_value = F.mse_loss(v_pred_value, target_value.detach()) if self.use_value else None
         if per_element_loss_mask is None:
             loss_video = F.mse_loss(pred_video, target_video)
@@ -798,6 +879,31 @@ class FMPRunner(nn.Module,
             loss_video = (
                 F.mse_loss(pred_video, target_video, reduction="none") * per_element_loss_mask
             ).sum() / per_element_loss_mask.sum()
+        if (
+            self.stage2_enable_reverse_ar_action
+            and (
+                self.stage2_key_action_loss_weight > 0.0
+                or self.stage2_reverse_ar_action_loss_weight > 0.0
+            )
+        ):
+            key_action_loss, reverse_ar_action_loss = self._compute_stage2_reverse_ar_action_loss(
+                lang_tokens=lang_tokens,
+                img_tokens=img_tokens,
+                state_tokens=state_tokens,
+                action_gt=stage2_action_gt,
+                action_mask=action_mask,
+                action_valid_mask=stage2_action_valid_mask,
+                video_kv_mask_mode=video_kv_mask_mode,
+            )
+            loss_action = (
+                loss_action
+                + self.stage2_key_action_loss_weight * key_action_loss
+                + self.stage2_reverse_ar_action_loss_weight * reverse_ar_action_loss
+            )
+            self.last_stage2_metrics = {
+                "loss_stage2_key_action": key_action_loss.detach(),
+                "loss_stage2_reverse_ar_action": reverse_ar_action_loss.detach(),
+            }
         # loss = loss_action + loss_video
         return loss_action, loss_video, loss_value
 

@@ -185,6 +185,13 @@ def flatten_model_config_v2(raw: Dict[str, Any]) -> Dict[str, Any]:
                 mroot["pretrained_video_expert_path"] = w["video_expert"]
             if w.get("video_base_model") is not None:
                 mroot["VIDEO_BASE_MODEL"] = w["video_base_model"]
+            for k in (
+                "stage2_enable_reverse_ar_action",
+                "stage2_key_action_loss_weight",
+                "stage2_reverse_ar_action_loss_weight",
+            ):
+                if tr.get(k) is not None:
+                    mroot[k] = tr[k]
 
     if tr_batch.get("train") is not None:
         out["train_batch_size"] = tr_batch["train"]
@@ -202,6 +209,9 @@ def flatten_model_config_v2(raw: Dict[str, Any]) -> Dict[str, Any]:
         ("sample_compute_video_metrics", "sample_compute_video_metrics"),
         ("sample_sharded_inference", "sample_sharded_inference"),
         ("reverse_world_order", "reverse_world_order"),
+        ("stage2_enable_reverse_ar_action", "stage2_enable_reverse_ar_action"),
+        ("stage2_key_action_loss_weight", "stage2_key_action_loss_weight"),
+        ("stage2_reverse_ar_action_loss_weight", "stage2_reverse_ar_action_loss_weight"),
         ("checkpoints_total_limit", "checkpoints_total_limit"),
         ("dataloader_num_workers", "dataloader_num_workers"),
         ("gradient_accumulation_steps", "gradient_accumulation_steps"),

@@ -78,75 +78,136 @@ training:
   - forward-view GT vs Pred
 
 
-## Stage 2: Add Keyframe / Key Action Prediction
+## Stage 2: CoA-Style Semantic Keypoint + Reverse Autoregressive Anchors
 
 ### Scheme Overview
 
-Keep reverse generation conditioned on GT keyframes for now, but add explicit key prediction losses. The model learns:
+Upgrade the Stage 1 oracle reverse WVWAM into a CoA-style semantic-keypoint training setup. The key change is that the terminal anchor is no longer a fixed `t+H`; it is the next semantic keypoint sampled from the episode. The model should learn to generate from a semantic key anchor backward to the current state/action segment.
 
-- `O_t -> x_{t+H}`
-- `O_t -> a_key` or `s_{t+H}`
+Stage 2 has two training goals:
 
-This stage decouples key prediction quality from reverse generation quality.
+- keep reverse video diffusion conditioned on the semantic keyframe clip, so video quality remains comparable to Stage 1;
+- add CoA-style action supervision: the first token in reverse order is the key action, and the action branch learns a teacher-forced reverse-autoregressive auxiliary objective.
 
 ### Scheme Details
 
-Add auxiliary prediction targets:
+Semantic keypoint sampling:
 
-- `key_video_gt = VAE(x_{t+H})` or RGB terminal frame
-- `key_action_gt = a_{t+H-1}`
-- optionally `key_state_gt = s_{t+H}` if available from the dataset
+1. Trim static episode heads/tails using the current qpos/action preprocessing.
+2. Discover candidate keypoints:
+   - gripper open/close changes;
+   - low velocity or near-stop boundaries;
+   - episode end as fallback.
+3. Sample a valid pair `(t_start, t_key)` satisfying:
+   - `min_subtrajectory_len <= t_key - t_start <= max_subtrajectory_len`;
+   - keypoints are separated by `keypoint_min_gap`.
+4. Return variable-length clips padded to the existing fixed tensor shape:
+   - `video_forward = x_t, ..., x_key`, padded to `CHUNK_SIZE + 1`;
+   - `action_forward = a_t, ..., a_{key-1}`, padded to `CHUNK_SIZE`;
+   - `video_valid_mask` and `action_valid_mask` mark the real prefix.
 
-Total loss:
+Reverse training view:
 
 ```text
-loss = loss_reverse_video
-     + loss_reverse_action
-     + lambda_video_key * loss_key_video
-     + lambda_action_key * loss_key_action
+video_reverse  = x_key, ..., x_t
+action_reverse = a_{key-1}, ..., a_t
 ```
 
-For a first implementation, key video prediction can be supervised in latent space to avoid expensive RGB-space modeling.
+CoA-style action auxiliary target:
+
+```text
+decoder input:  SOS, a_key, a_{key-1}, ..., a_{t+1}
+target:         a_key, a_{key-1}, ..., a_t
+```
+
+In the first engineering version, this is implemented as an auxiliary reverse-AR action loss on top of the existing diffusion action loss:
+
+```text
+loss = loss_reverse_video_diffusion
+     + loss_reverse_action_diffusion
+     + lambda_key_action * loss_key_action
+     + lambda_reverse_ar_action * loss_reverse_ar_action
+```
+
+`loss_key_action` supervises the first valid reverse action token. `loss_reverse_ar_action` supervises the complete valid reversed action sequence with padding masked out.
 
 ### Validation Goal
 
-Verify that the model can predict a usable future anchor from the current observation:
+Verify that semantic anchors and CoA-style reverse action supervision are useful before replacing the whole action expert inference path:
 
-- Is predicted `x_{t+H}` visually close to GT?
-- Is predicted key action/state numerically close to GT?
-- Does key prediction improve over training?
+- Does semantic-keypoint sampling produce meaningful subtrajectory boundaries?
+- Does masked variable-length training remain stable?
+- Does action key prediction improve over training?
+- Does reverse-AR auxiliary action loss decrease without hurting video/action diffusion losses?
+- Are generated forward-view videos still aligned with task progress?
 
 ### Engineering Implementation
 
-Dataset / train module:
+Dataset:
 
-- Expose `key_video_frame = video[:, -1]`.
-- Expose `key_action = actions[:, -1]`.
-- If available, expose `key_state = qpos/state at t+H`.
+- Add `data.dataset.subtrajectory_mode: semantic_keypoint`.
+- Return `subtraj_len`, `keypoint_type`, `keypoint_index`.
+- Return `action_valid_mask` and `video_valid_mask`.
+- Pad variable-length action/video prefixes by repeating the last valid step.
+
+Train module:
+
+- Reverse only valid prefixes when `reverse_world_order=true`.
+- Keep padding at the tail after reversal.
+- Pass `action_valid_mask` into action losses.
+- Crop video metrics/visualization to the valid frame count.
 
 Runner/model:
 
-- Add `pred_key_video`.
-- Add `pred_key_action` or `pred_key_state`.
-- Add key losses in `compute_loss`.
+- Keep the existing diffusion reverse video/action path.
+- Add a Stage 2 auxiliary action path controlled by config:
+  - `stage2_enable_reverse_ar_action`;
+  - `stage2_key_action_loss_weight`;
+  - `stage2_reverse_ar_action_loss_weight`.
+- Compute key-action loss on the first valid reverse action token.
+- Compute reverse-AR teacher-forcing action loss on valid action tokens only.
+- Log auxiliary metrics separately from the main diffusion losses.
 
 Suggested config fields:
 
 ```yaml
+data:
+  dataset:
+    subtrajectory_mode: semantic_keypoint
+    min_subtrajectory_len: 4
+    max_subtrajectory_len: 32
+    keypoint_min_gap: 5
+    keypoint_velocity_threshold: 0.01
+    keypoint_gripper_threshold: 0.1
+
 training:
-  train_key_video: true
-  train_key_action: true
-  key_loss_weight_video: 1.0
-  key_loss_weight_action: 1.0
+  reverse_world_order: true
+  stage2_enable_reverse_ar_action: true
+  stage2_key_action_loss_weight: 0.1
+  stage2_reverse_ar_action_loss_weight: 0.1
 ```
 
 ### Validation Plan
 
-- Log key video latent L1/MSE.
-- Decode predicted key video and compare with GT `x_{t+H}`.
-- Log key action/state L1/MSE.
-- Separately inspect gripper dimensions and major joint dimensions.
-- Keep reverse generation conditioned on GT keyframes during this stage.
+- Dataset analysis:
+  - keypoints per episode;
+  - subtrajectory length distribution;
+  - keypoint type distribution;
+  - visual examples of extracted keypoint segments.
+- Training smoke test:
+  - verify no empty sample directories during metric-only steps;
+  - verify valid-mask reversal keeps padding at the tail;
+  - verify `loss_stage2_key_action` and `loss_stage2_reverse_ar_action` are logged.
+- Ablations:
+  - fixed horizon + reverse oracle;
+  - semantic keypoint + reverse oracle;
+  - semantic keypoint + Stage 2 auxiliary action losses off;
+  - semantic keypoint + Stage 2 auxiliary action losses on.
+- Metrics:
+  - video PSNR/SSIM/L1 on valid frames;
+  - action L1/MSE on valid steps;
+  - key action L1/MSE;
+  - reverse-AR action L1/MSE.
 
 
 ## Stage 3: Predicted Key Scheduled Sampling

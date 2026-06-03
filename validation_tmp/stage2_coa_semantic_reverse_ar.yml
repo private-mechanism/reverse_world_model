@@ -1,20 +1,20 @@
 # =============================================================================
-# Stage 1 validation: semantic-keypoint oracle reverse WVWAM.
+# Stage 2 validation: CoA-style semantic-keypoint reverse WVWAM.
 #
 # Goal:
-#   Verify that WVWAM can learn reverse-time video/action targets when the
-#   terminal video frame is still provided by the GT semantic-keypoint clip.
+#   Keep semantic-keypoint oracle reverse video/action training, and add a
+#   teacher-forced reverse-AR action auxiliary objective:
+#     SOS -> key action -> previous action -> ... -> current action.
 #
 # What this enables:
 #   - subtrajectory_mode=semantic_keypoint samples start -> next CoA-style keypoint.
 #   - reverse_world_order=true flips valid video/action targets in world training.
-#   - video/action metrics are computed in the same reverse target view.
-#   - forward_view videos are also saved for human inspection.
+#   - Stage 2 auxiliary losses supervise key action and full reverse action sequence.
+#   - forward_view videos are saved for human inspection.
 # =============================================================================
 schema_version: 2
 num_sample_batches: 1
 
-# Extra flat keys supported by the config loader.
 sample_video_metric_period: 2
 sample_video_visual_period: 200
 sample_video_visual_on_step0: true
@@ -22,9 +22,9 @@ sample_save_forward_view: true
 sample_video_max_rank: 2
 
 experiment:
-  id: stage1-reverse-world-oracle
+  id: stage2-coa-semantic-reverse-ar
   wandb_project: Reverse-WVWAM-Validation
-  config_name: stage1_reverse_world_oracle
+  config_name: stage2_coa_semantic_reverse_ar
   cuda_visible_devices: "0,1"
 
 data:
@@ -79,6 +79,7 @@ architecture:
       use_new_rope: true
       scaling: 4.0
       use_value: false
+      frame_causal_self_attn: true
     action_noise_scheduler:
       type: flow
       num_train_timesteps: 1000
@@ -98,7 +99,7 @@ architecture:
   image_aug_type: mixed
 
 checkpoints:
-  run_name: validation-stage1-reverse-world-oracle
+  run_name: validation-stage2-coa-semantic-reverse-ar
   root_dir: /mnt/world_foundational_model/fyzhao/reverse_world_model/checkpoints/
 
 weights:
@@ -110,6 +111,9 @@ weights:
 
 training:
   reverse_world_order: true
+  stage2_enable_reverse_ar_action: true
+  stage2_key_action_loss_weight: 0.1
+  stage2_reverse_ar_action_loss_weight: 0.1
   batch:
     train: 2
     sample: 2

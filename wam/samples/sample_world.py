@@ -128,6 +128,21 @@ def _reverse_world_order_enabled(args) -> bool:
     return bool(getattr(args, "reverse_world_order", False))
 
 
+def _reverse_valid_padded_sequence(sequence: torch.Tensor, valid_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    if valid_mask is None:
+        return torch.flip(sequence, dims=[1])
+    out = sequence.clone()
+    max_len = sequence.shape[1]
+    lengths = valid_mask.detach().to(device=sequence.device).float().sum(dim=1).long().clamp(min=1, max=max_len)
+    for batch_idx, valid_len in enumerate(lengths.tolist()):
+        valid = sequence[batch_idx, :valid_len]
+        reversed_valid = torch.flip(valid, dims=[0])
+        out[batch_idx, :valid_len] = reversed_valid
+        if valid_len < max_len:
+            out[batch_idx, valid_len:] = reversed_valid[-1:]
+    return out
+
+
 @torch.no_grad()
 def log_sample_res(
     vae,
@@ -257,11 +272,17 @@ def log_sample_res(
             # We only use the last state as input
             states = states[:, -1:, :]
             actions = batch["actions"].to(dtype=weight_dtype)
+            action_valid_mask = batch.get("action_valid_mask", None)
+            if action_valid_mask is not None:
+                action_valid_mask = action_valid_mask.to(device=actions.device, dtype=weight_dtype)
+            video_valid_mask = batch.get("video_valid_mask", None)
+            if video_valid_mask is not None:
+                video_valid_mask = video_valid_mask.to(device=video.device, dtype=weight_dtype) if video is not None else None
             reverse_world_order = _reverse_world_order_enabled(args)
             if reverse_world_order:
-                actions = torch.flip(actions, dims=[1])
+                actions = _reverse_valid_padded_sequence(actions, action_valid_mask)
                 if video is not None:
-                    video = torch.flip(video, dims=[1])
+                    video = _reverse_valid_padded_sequence(video, video_valid_mask)
             state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
 
             vae_mini_batch = int(getattr(args, "vae_mini_batch", 1))
@@ -356,6 +377,9 @@ def log_sample_res(
                     video_orig = vae.decode_to_video(video_latents, to_save=True)[0]
                     video_pred = vae.decode_to_video(pred_video, to_save=True)[0]
                     n_frames = min(video_orig.shape[0], video_pred.shape[0])
+                    if video_valid_mask is not None:
+                        valid_frames = int(video_valid_mask[0].detach().float().sum().item())
+                        n_frames = min(n_frames, max(1, valid_frames))
                     video_orig = video_orig[:n_frames]
                     video_pred = video_pred[:n_frames]
                     metric_reduce = distributed_reduce and not sample_sharded_inference
@@ -393,6 +417,8 @@ def log_sample_res(
 
                 num_steps = pred_actions.shape[1]
                 expanded_state_elem_mask = (state_elem_mask.unsqueeze(1).tile((1, num_steps, 1)).float())
+                if action_valid_mask is not None:
+                    expanded_state_elem_mask = expanded_state_elem_mask * action_valid_mask[:, :num_steps, None].float()
 
                 loss = F.mse_loss(pred_actions, actions, reduction="none").float()
                 l1_elem = (pred_actions - actions).abs().float()

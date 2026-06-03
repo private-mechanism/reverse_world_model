@@ -13,11 +13,37 @@ import torch
 import torch.nn as nn
 
 
-def maybe_reverse_world_batch(video: torch.Tensor, actions: torch.Tensor, args) -> Tuple[torch.Tensor, torch.Tensor]:
+def reverse_valid_padded_sequence(sequence: torch.Tensor, valid_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    """Reverse only valid timesteps and keep padding at the end."""
+    if valid_mask is None:
+        return torch.flip(sequence, dims=[1])
+    out = sequence.clone()
+    max_len = sequence.shape[1]
+    lengths = valid_mask.detach().to(device=sequence.device).float().sum(dim=1).long().clamp(min=1, max=max_len)
+    for batch_idx, valid_len in enumerate(lengths.tolist()):
+        valid = sequence[batch_idx, :valid_len]
+        reversed_valid = torch.flip(valid, dims=[0])
+        out[batch_idx, :valid_len] = reversed_valid
+        if valid_len < max_len:
+            out[batch_idx, valid_len:] = reversed_valid[-1:]
+    return out
+
+
+def maybe_reverse_world_batch(
+    video: torch.Tensor,
+    actions: torch.Tensor,
+    args,
+    *,
+    video_valid_mask: Optional[torch.Tensor] = None,
+    action_valid_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reverse video/action targets for oracle reverse WVWAM experiments."""
     if not bool(getattr(args, "reverse_world_order", False)):
         return video, actions
-    return torch.flip(video, dims=[1]), torch.flip(actions, dims=[1])
+    return (
+        reverse_valid_padded_sequence(video, video_valid_mask),
+        reverse_valid_padded_sequence(actions, action_valid_mask),
+    )
 
 
 class TrainModule:
@@ -44,7 +70,15 @@ class TrainModule:
         images = batch["images"]
         states = batch["states"][:, -1:, :]
         actions = batch["actions"]
-        video, actions = maybe_reverse_world_batch(video, actions, args)
+        action_valid_mask = batch.get("action_valid_mask", None)
+        video_valid_mask = batch.get("video_valid_mask", None)
+        video, actions = maybe_reverse_world_batch(
+            video,
+            actions,
+            args,
+            video_valid_mask=video_valid_mask,
+            action_valid_mask=action_valid_mask,
+        )
         value = batch.get("value", None)
         state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
         ctrl_freqs = batch["ctrl_freqs"]
@@ -88,6 +122,7 @@ class TrainModule:
             video_latents=video_latents,
             condition_video_latents=condition_video_latents,
             value=value,
+            action_valid_mask=action_valid_mask,
         )
         loss = loss_a + loss_v
         return loss, loss_a, loss_v, loss_value
