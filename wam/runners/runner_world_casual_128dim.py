@@ -941,8 +941,10 @@ class FMPRunner(nn.Module,
             state_tokens = state_tokens.repeat(sample_batch_size, 1, 1)
             lang_tokens = lang_tokens.repeat(sample_batch_size, 1, 1)
             img_tokens = img_tokens.repeat(sample_batch_size, 1, 1)
-            video_latents = video_latents.repeat(sample_batch_size, 1, 1, 1, 1)
-            condition_video_latents = condition_video_latents.repeat(sample_batch_size, 1, 1, 1, 1)
+            if video_latents is not None:
+                video_latents = video_latents.repeat(sample_batch_size, 1, 1, 1, 1)
+            if condition_video_latents is not None:
+                condition_video_latents = condition_video_latents.repeat(sample_batch_size, 1, 1, 1, 1)
 
         # (1) 准备输入
         # (2) 调用扩散采样

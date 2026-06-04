@@ -205,6 +205,7 @@ def load_wam_checkpoint_into_world_policy(world, ckpt_root: str) -> None:
     root = os.path.expanduser(str(ckpt_root))
     pt_path = os.path.join(root, "pytorch_model", "mp_rank_00_model_states.pt")
     st_path = os.path.join(root, "model.safetensors")
+    bin_path = os.path.join(root, "pytorch_model.bin")
     raw: dict
     if os.path.isfile(pt_path):
         ckpt = torch.load(pt_path, map_location="cpu")
@@ -213,9 +214,15 @@ def load_wam_checkpoint_into_world_policy(world, ckpt_root: str) -> None:
         from safetensors.torch import load_file
 
         raw = load_file(st_path)
+    elif os.path.isfile(bin_path):
+        try:
+            raw = torch.load(bin_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            raw = torch.load(bin_path, map_location="cpu")
     else:
         raise ValueError(
-            f"pretrained_wam_path={root!r} 下未找到 pytorch_model/mp_rank_00_model_states.pt 或 model.safetensors"
+            f"pretrained_wam_path={root!r} 下未找到 pytorch_model/mp_rank_00_model_states.pt、"
+            "model.safetensors 或 pytorch_model.bin"
         )
     if not isinstance(raw, dict):
         raise ValueError(f"checkpoint 格式异常: 期望 state_dict dict，得到 {type(raw)}")
