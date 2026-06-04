@@ -37,6 +37,60 @@ Training targets:
 
 This is an oracle setting because `x_{t+H}` and terminal action/state come from the dataset.
 
+### Loss Function and Current Weights
+
+Stage 1 keeps the original diffusion objectives unchanged. Only the temporal order of video/action targets changes when `reverse_world_order=true`.
+
+Actual training objective:
+
+```text
+L_stage1 = L_action_diffusion + L_video_diffusion
+```
+
+Action diffusion loss:
+
+```text
+noise_for_action ~ N(0, I)
+noisy_action = scheduler.add_noise(action_gt, noise_for_action, t_action)
+target_action = noise_for_action - action_gt
+L_action_diffusion = MSE(pred_action, target_action)
+```
+
+If `action_valid_mask` is present, the MSE is masked over valid action steps only.
+
+Video diffusion loss:
+
+```text
+noise_for_video ~ N(0, I)
+noisy_video = scheduler.add_noise(video_latents, noise_for_video, t_video)
+target_video = noise_for_video - video_latents
+L_video_diffusion = MSE(pred_video, target_video)
+```
+
+Current runnable config:
+
+```text
+validation_tmp/stage1_reverse_world_oracle.yml
+```
+
+Current Stage 1 weights:
+
+```yaml
+training:
+  reverse_world_order: true
+  generation_mode: diffusion  # implicit default
+  stage2_enable_reverse_ar_action: false  # implicit default
+  stage3_replace_action_diffusion: false  # implicit default
+  stage3_replace_video_diffusion: false   # implicit default
+```
+
+Therefore:
+
+```text
+loss_a = L_action_diffusion
+loss_v = L_video_diffusion
+```
+
 ### Validation Goal
 
 Verify that backward dynamics are learnable under oracle terminal conditions:
@@ -131,6 +185,80 @@ loss = loss_reverse_video_diffusion
 
 `loss_key_action` supervises the first valid reverse action token. `loss_reverse_ar_action` supervises the complete valid reversed action sequence with padding masked out.
 
+### Loss Function and Current Weights
+
+Stage 2 keeps diffusion as the main path and adds reverse-AR action losses as auxiliary supervision.
+
+Actual training objective:
+
+```text
+L_stage2 = L_action_diffusion
+         + L_video_diffusion
+         + lambda_stage2_key_action * L_stage2_key_action
+         + lambda_stage2_reverse_ar_action * L_stage2_reverse_ar_action
+```
+
+Action diffusion term:
+
+```text
+L_action_diffusion = masked MSE(v_pred_action, target_action)
+```
+
+Video diffusion term:
+
+```text
+L_video_diffusion = MSE(pred_video, target_video)
+```
+
+Stage 2 key action term:
+
+```text
+reverse_action_gt = a_key, a_{key-1}, ..., a_t
+L_stage2_key_action = masked MSE(pred_reverse_action[:, 0], reverse_action_gt[:, 0])
+```
+
+Stage 2 reverse-AR action term:
+
+```text
+decoder_input = SOS, a_key, a_{key-1}, ..., a_{t+1}
+target        = a_key, a_{key-1}, ..., a_t
+L_stage2_reverse_ar_action = masked MSE(pred_reverse_action, target)
+```
+
+Current runnable config:
+
+```text
+validation_tmp/stage2_coa_semantic_reverse_ar.yml
+```
+
+Current Stage 2 weights:
+
+```yaml
+training:
+  reverse_world_order: true
+  generation_mode: diffusion  # implicit default
+  stage2_enable_reverse_ar_action: true
+  stage2_key_action_loss_weight: 0.1
+  stage2_reverse_ar_action_loss_weight: 0.1
+```
+
+Therefore the logged action loss is:
+
+```text
+loss_a = L_action_diffusion
+       + 0.1 * L_stage2_key_action
+       + 0.1 * L_stage2_reverse_ar_action
+
+loss_v = L_video_diffusion
+```
+
+Logged auxiliary metrics:
+
+```text
+loss_stage2_key_action
+loss_stage2_reverse_ar_action
+```
+
 ### Validation Goal
 
 Verify that semantic anchors and CoA-style reverse action supervision are useful before replacing the whole action expert inference path:
@@ -210,86 +338,239 @@ training:
   - reverse-AR action L1/MSE.
 
 
-## Stage 3: Predicted Key Scheduled Sampling
+## Stage 3: Predicted Key + Reverse Autoregressive Generation
 
 ### Scheme Overview
 
-Gradually replace GT keyframe/action conditions with model-predicted keyframe/action conditions during training.
+Upgrade Stage 2 from "diffusion main path + reverse-AR auxiliary loss" to a CoA-style generation path where the model first predicts semantic key anchors, then autoregressively generates video/action backward from those anchors.
 
-Early training uses GT anchors. Later training uses predicted anchors more often.
+The intended inference chain is:
+
+```text
+current observation x_t, state_t, instruction
+  -> predict future semantic keyframe / key action
+  -> reverse-AR generate x_key -> ... -> x_t and a_key -> ... -> a_t
+  -> reverse generated sequences back to forward order for execution/visualization
+```
+
+The important engineering constraint is incremental rollback. Stage 3 must be controlled by explicit switches so we can quickly return to:
+
+- earliest diffusion behavior: `generation_mode: diffusion`, `reverse_world_order: false`;
+- Stage 1 oracle reverse diffusion: `generation_mode: diffusion`, `reverse_world_order: true`, fixed horizon;
+- Stage 2 semantic-keypoint reverse diffusion plus auxiliary action AR: `generation_mode: diffusion`, `stage2_enable_reverse_ar_action: true`;
+- Stage 3 reverse-AR action main path: `generation_mode: reverse_ar`, `stage3_replace_action_diffusion: true`.
 
 ### Scheme Details
 
-Use a probability schedule:
+Stage 3 decomposes generation into key prediction and reverse autoregressive decoding.
+
+Video path:
 
 ```text
-p_pred_key = schedule(global_step)
+keyframe predictor:
+  input:  instruction + current visual tokens x_t + state_t
+  target: z_key = VAE(x_key)
+
+reverse video AR decoder:
+  input:  SOS, z_key, z_{key-1}, ..., z_{t+1}
+  target: z_key, z_{key-1}, ..., z_t
 ```
 
-Examples:
-
-- early: `p_pred_key = 0.0`
-- middle: `p_pred_key = 0.25` or `0.5`
-- late: `p_pred_key = 0.75` or `1.0`
-
-Video condition:
+Action path:
 
 ```text
-condition_video = GT x_{t+H} or predicted x_{t+H}
+key action predictor:
+  input:  instruction + current visual tokens x_t + state_t
+  target: a_key
+
+reverse action AR decoder:
+  input:  SOS, a_key, a_{key-1}, ..., a_{t+1}
+  target: a_key, a_{key-1}, ..., a_t
 ```
 
-Action condition:
+The Stage 3 action path can reuse the existing action expert if causal self-attention is enabled. The Stage 3 video AR path should not overwrite the existing diffusion video expert. It needs a separate AR decoder path or a clearly gated mode.
+
+### Loss Function and Current Weights
+
+Stage 3 is designed to replace diffusion with reverse-AR generation. The current implemented code replaces **action diffusion** with reverse-AR action loss, while video still uses diffusion fallback because the video AR decoder has not been implemented yet.
+
+Implemented training objective in the current runnable code:
 
 ```text
-condition_action/state = GT key or predicted key
+L_stage3_current = L_stage3_action_main + L_stage3_video_diffusion_fallback
 ```
 
-Initially, predicted keys can be detached before feeding them into reverse generation. Later, test end-to-end gradients.
+Action main loss:
 
-### Validation Goal
+```text
+L_stage3_action_main =
+    lambda_stage3_key_action * L_stage3_key_action
+  + lambda_stage3_action_ar * L_stage3_reverse_ar_action
+```
 
-Verify whether predicted keyframes/actions can serve as stable reverse-generation anchors.
+Stage 3 key action term:
 
-Important questions:
+```text
+reverse_action_gt = a_key, a_{key-1}, ..., a_t
+L_stage3_key_action = masked MSE(pred_reverse_action[:, 0], reverse_action_gt[:, 0])
+```
 
-- How much does reverse generation degrade when using predicted keys?
-- Does scheduled sampling reduce the train/test mismatch?
-- Is key prediction error strongly correlated with rollout error?
+Stage 3 reverse-AR action term:
 
-### Engineering Implementation
+```text
+decoder_input = SOS, generated_or_teacher_forced_reverse_actions
+target        = a_key, a_{key-1}, ..., a_t
+L_stage3_reverse_ar_action = masked MSE(pred_reverse_action, target)
+```
 
-Add a key condition mode:
+Current implementation uses the same teacher-forced reverse-AR action path as Stage 2, but makes it the action main objective instead of an auxiliary objective.
+
+Video fallback term:
+
+```text
+L_stage3_video_diffusion_fallback = L_video_diffusion
+```
+
+Current runnable config:
+
+```text
+validation_tmp/stage3_predicted_key_reverse_ar.yml
+```
+
+Current Stage 3 weights used by the running code:
 
 ```yaml
 training:
-  key_condition_mode: scheduled  # gt | pred | scheduled
-  pred_key_prob: 0.5
-  detach_pred_key_condition: true
+  reverse_world_order: true
+  generation_mode: reverse_ar
+  stage2_enable_reverse_ar_action: false
+  stage2_key_action_loss_weight: 0.0
+  stage2_reverse_ar_action_loss_weight: 0.0
+  stage3_replace_action_diffusion: true
+  stage3_replace_video_diffusion: false
+  stage3_key_action_loss_weight: 1.0
+  stage3_action_ar_loss_weight: 1.0
+  stage3_keyframe_loss_weight: 1.0
+  stage3_video_ar_loss_weight: 1.0
 ```
 
-Implementation points:
+Because `stage3_replace_video_diffusion=false`, `stage3_keyframe_loss_weight` and `stage3_video_ar_loss_weight` are reserved but not active in the current code.
 
-- In the train module or runner, choose GT vs predicted key per batch/sample.
-- Feed selected key into video/action reverse condition.
-- Start with `detach_pred_key_condition=true`.
-- Later test end-to-end key conditioning.
+Therefore the logged losses are:
+
+```text
+loss_a = 1.0 * L_stage3_key_action
+       + 1.0 * L_stage3_reverse_ar_action
+
+loss_v = L_stage3_video_diffusion_fallback
+```
+
+Logged Stage 3 metrics:
+
+```text
+loss_stage3_key_action
+loss_stage3_reverse_ar_action
+loss_stage3_action_main
+loss_stage3_video_diffusion_fallback
+```
+
+Future full Stage 3 objective after video AR decoder is implemented:
+
+```text
+L_stage3_full =
+    lambda_keyframe * L_stage3_keyframe
+  + lambda_video_ar * L_stage3_video_ar
+  + lambda_key_action * L_stage3_key_action
+  + lambda_action_ar * L_stage3_reverse_ar_action
+```
+
+With the planned default weights:
+
+```text
+lambda_keyframe = 1.0
+lambda_video_ar = 1.0
+lambda_key_action = 1.0
+lambda_action_ar = 1.0
+```
+
+### Causal Attention Policy
+
+Only the reverse-AR decoders need causal attention:
+
+- keyframe predictor: non-causal over condition tokens;
+- key action predictor: non-causal over condition tokens;
+- reverse video AR decoder: causal self-attention over generated video tokens;
+- reverse action AR decoder: causal self-attention over generated action tokens;
+- cross-attention / conditioning tokens: fully visible.
+
+Do not globally force the original diffusion video expert to be causal. Diffusion denoising predicts the whole noisy sequence in parallel and should keep its existing attention behavior. The Stage 3 video AR path must be gated separately.
+
+### Engineering Implementation
+
+Add Stage 3 switches:
+
+```yaml
+training:
+  generation_mode: reverse_ar  # diffusion | reverse_ar
+  stage3_predict_keyframe: true
+  stage3_predict_key_action: true
+  stage3_replace_video_diffusion: false
+  stage3_replace_action_diffusion: true
+  stage3_video_ar_causal_attention: true
+  stage3_action_ar_causal_attention: true
+  stage3_keyframe_loss_weight: 1.0
+  stage3_video_ar_loss_weight: 1.0
+  stage3_key_action_loss_weight: 1.0
+  stage3_action_ar_loss_weight: 1.0
+  stage3_use_scheduled_sampling: false
+  stage3_key_teacher_forcing_prob_start: 1.0
+  stage3_key_teacher_forcing_prob_end: 0.0
+  stage3_key_teacher_forcing_decay_steps: 20000
+```
+
+Current incremental implementation:
+
+- `generation_mode=diffusion` keeps Stage 1/Stage 2 behavior unchanged.
+- `generation_mode=reverse_ar` plus `stage3_replace_action_diffusion=true` replaces the action diffusion loss with reverse-AR key/action losses.
+- Stage 3 action-only inference calls the reverse-AR action sampler instead of the action diffusion sampler.
+- `stage3_replace_video_diffusion=false` keeps video diffusion as a fallback while the video AR decoder is developed.
+- `stage3_replace_video_diffusion=true` should fail fast until the video AR decoder is implemented, so we do not silently claim full Stage 3 video replacement.
+
+Future video implementation:
+
+- add a keyframe latent prediction head;
+- add a video latent reverse-AR decoder with causal self-attention;
+- compute masked `loss_stage3_keyframe` and `loss_stage3_video_ar`;
+- decode predicted forward-view videos by reversing the generated reverse sequence.
+
+### Validation Goal
+
+Verify the Stage 3 migration in isolated steps:
+
+- action reverse-AR can fully replace action diffusion without training crashes;
+- key action and reverse-AR action losses decrease under semantic-keypoint sampling;
+- action-only RoboTwin online evaluation runs through the reverse-AR policy path;
+- video diffusion fallback still preserves Stage 2 visualization/metrics;
+- later, predicted keyframe + video AR can replace video diffusion without degrading forward-view alignment.
 
 ### Validation Plan
 
-Compare three conditions:
+Run ablations with explicit switches:
 
-- GT key oracle
-- predicted key, detached
-- predicted key, end-to-end
+- original forward/diffusion baseline;
+- Stage 1 fixed-horizon reverse diffusion;
+- Stage 2 semantic-keypoint reverse diffusion with auxiliary AR action on/off;
+- Stage 3 semantic-keypoint reverse-AR action main path with video diffusion fallback;
+- future full Stage 3: reverse-AR video + reverse-AR action.
 
 Track:
 
-- video PSNR/SSIM/L1
-- action L1/MSE
-- key prediction error
-- rollout error conditioned on predicted key
-
-Inspect whether predicted-key forward-view videos drift away from the intended task goal.
+- `loss_stage3_key_action`;
+- `loss_stage3_reverse_ar_action`;
+- `loss_stage3_action_main`;
+- `loss_stage3_video_diffusion_fallback`;
+- action L1/MSE on valid tokens after reversing back to forward order;
+- RoboTwin online success rate with `test_num=1`, then `test_num=10`, then multi-task.
 
 
 ## Stage 4: CoA-Style Semantic Keypoint / Variable-Length Subtrajectory
@@ -368,6 +649,49 @@ Dataset should return:
 - optionally `key_state`
 
 Loss functions must apply masks.
+
+### Loss Function and Current Weights
+
+Stage 4 is primarily a dataset/subtrajectory sampling stage. It does not require a new model loss by itself. The loss depends on which generation mode is paired with semantic keypoint sampling.
+
+If paired with Stage 2:
+
+```text
+L_stage4_with_stage2 =
+    L_action_diffusion
+  + L_video_diffusion
+  + 0.1 * L_stage2_key_action
+  + 0.1 * L_stage2_reverse_ar_action
+```
+
+Current Stage 2 semantic-keypoint config uses:
+
+```yaml
+data:
+  dataset:
+    subtrajectory_mode: semantic_keypoint
+    min_subtrajectory_len: 4
+    max_subtrajectory_len: 32
+    keypoint_min_gap: 5
+    keypoint_velocity_threshold: 0.01
+    keypoint_gripper_threshold: 0.1
+
+training:
+  generation_mode: diffusion
+  stage2_key_action_loss_weight: 0.1
+  stage2_reverse_ar_action_loss_weight: 0.1
+```
+
+If paired with current Stage 3:
+
+```text
+L_stage4_with_stage3_current =
+    1.0 * L_stage3_key_action
+  + 1.0 * L_stage3_reverse_ar_action
+  + L_stage3_video_diffusion_fallback
+```
+
+In both cases, all action/video sequence losses must use `action_valid_mask` / `video_valid_mask` so padded steps do not contribute.
 
 ### Validation Plan
 
@@ -450,6 +774,51 @@ L_total = L_reg + lambda * L_latent
 Optional MTP:
 
 At each reverse decoding step, predict the next `K` reversed tokens for local continuity. Use MTP only during training.
+
+### Loss Function and Current Weights
+
+Stage 5 is a future stronger action expert variant. It is not the currently running Stage 3 implementation. The currently running Stage 3 action AR loss is simpler:
+
+```text
+L_stage3_action_main =
+    1.0 * masked MSE(pred_reverse_action[:, 0], reverse_action_gt[:, 0])
+  + 1.0 * masked MSE(pred_reverse_action, reverse_action_gt)
+```
+
+The proposed Stage 5 latent-decoder version would use:
+
+```text
+L_stage5 =
+    lambda_reg * L_reg
+  + lambda_latent * L_latent
+  + lambda_mtp * L_mtp
+```
+
+Where:
+
+```text
+L_reg = masked MSE(action_decoder(x_hat_rev), action_rev)
+L_latent = masked MSE(x_hat_rev, stopgrad(action_encoder(action_rev)))
+L_mtp = optional multi-token prediction loss over the next K reverse tokens
+```
+
+Recommended initial weights for a future Stage 5 config:
+
+```yaml
+training:
+  action_generation_mode: reverse_ar
+  stage5_reg_loss_weight: 1.0
+  stage5_latent_loss_weight: 0.1
+  stage5_mtp_loss_weight: 0.0
+```
+
+Then enable MTP only after the base AR decoder is stable:
+
+```yaml
+training:
+  stage5_mtp_loss_weight: 0.1
+  stage5_mtp_horizon: 4
+```
 
 ### Validation Goal
 
