@@ -1,53 +1,53 @@
-# Reverse WVWAM / CoA-Inspired Research Plan
+# Reverse WVWAM / CoA 启发式研究计划
 
-This plan describes a staged path from the current reverse video-only experiment to a CoA-inspired WVWAM system where both video and action generation use reverse-time reasoning anchored by predicted keyframes / key actions.
+本文档描述一条分阶段路线：从当前的 reverse video-only 实验，推进到一个受 Chain-of-Action 启发的 WVWAM 系统。在目标系统中，video 与 action 生成都依赖由模型预测得到的 keyframe / key action，并围绕这些关键锚点进行逆时间推理。
 
-Core principle:
+核心原则：
 
-The goal is not only to flip trajectories. The model should first predict a keyframe anchor, then generate the local trajectory backward from that anchor, and finally reverse the generated sequence back to forward order for execution or visualization.
+目标不只是简单翻转轨迹。模型应该先预测一个 keyframe anchor，然后从该 anchor 开始向过去生成局部轨迹，最后再把生成序列翻回正向顺序，用于执行或可视化。
 
 
-## Stage 1: Fixed Horizon + GT Keyframe Oracle
+## 阶段 1: 固定 Horizon + GT Keyframe Oracle
 
-### Scheme Overview
+### 方案概览
 
-Use the current fixed horizon setting. For each training sub-trajectory, take the terminal frame/action as the keyframe anchor:
+使用当前 fixed horizon 设置。对每一个训练 sub-trajectory，取终点帧 / 终点 action 作为 keyframe anchor：
 
 - `video_forward = x_t, ..., x_{t+H}`
 - `video_reverse = x_{t+H}, ..., x_t`
 - `action_forward = a_t, ..., a_{t+H-1}`
 - `action_reverse = a_{t+H-1}, ..., a_t`
 
-The model uses ground-truth terminal information as the oracle condition. This isolates whether reverse video/action dynamics are learnable before we ask the model to predict the keyframe itself.
+模型使用 ground-truth 终点信息作为 oracle condition。这样可以先隔离验证：在要求模型自己预测 keyframe 之前，反向 video/action 动力学本身是否可学习。
 
-### Scheme Details
+### 方案细节
 
-For the current config:
+当前配置下：
 
 - `action_chunk_size = 32`
 - `sample_video_fps = 1`
-- each sub-trajectory contains 32 action steps and 33 video frames.
+- 每个 sub-trajectory 包含 32 个 action step 和 33 个 video frame。
 
-Training targets:
+训练目标：
 
 - Video condition: GT `x_{t+H}`
 - Video target: `x_{t+H} -> x_t`
-- Action condition: GT terminal action/state, if explicitly modeled
+- Action condition: GT terminal action/state，如果显式建模
 - Action target: `a_{t+H-1} -> a_t`
 
-This is an oracle setting because `x_{t+H}` and terminal action/state come from the dataset.
+这是 oracle 设置，因为 `x_{t+H}` 与 terminal action/state 都来自数据集。
 
-### Loss Function and Current Weights
+### Loss 函数与当前权重
 
-Stage 1 keeps the original diffusion objectives unchanged. Only the temporal order of video/action targets changes when `reverse_world_order=true`.
+阶段 1 保持原始 diffusion objective 不变。只有当 `reverse_world_order=true` 时，video/action target 的时间顺序会改变。
 
-Actual training objective:
+实际训练目标：
 
 ```text
 L_stage1 = L_action_diffusion + L_video_diffusion
 ```
 
-Action diffusion loss:
+Action diffusion loss：
 
 ```text
 noise_for_action ~ N(0, I)
@@ -56,9 +56,9 @@ target_action = noise_for_action - action_gt
 L_action_diffusion = MSE(pred_action, target_action)
 ```
 
-If `action_valid_mask` is present, the MSE is masked over valid action steps only.
+如果存在 `action_valid_mask`，则 MSE 只在有效 action step 上计算。
 
-Video diffusion loss:
+Video diffusion loss：
 
 ```text
 noise_for_video ~ N(0, I)
@@ -67,50 +67,50 @@ target_video = noise_for_video - video_latents
 L_video_diffusion = MSE(pred_video, target_video)
 ```
 
-Current runnable config:
+当前可运行配置：
 
 ```text
 validation_tmp/stage1_reverse_world_oracle.yml
 ```
 
-Current Stage 1 weights:
+当前 阶段 1 权重：
 
 ```yaml
 training:
   reverse_world_order: true
-  generation_mode: diffusion  # implicit default
-  stage2_enable_reverse_ar_action: false  # implicit default
-  stage3_replace_action_diffusion: false  # implicit default
-  stage3_replace_video_diffusion: false   # implicit default
+  generation_mode: diffusion  # 隐式默认
+  stage2_enable_reverse_ar_action: false  # 隐式默认
+  stage3_replace_action_diffusion: false  # 隐式默认
+  stage3_replace_video_diffusion: false   # 隐式默认
 ```
 
-Therefore:
+因此：
 
 ```text
 loss_a = L_action_diffusion
 loss_v = L_video_diffusion
 ```
 
-### Validation Goal
+### 验证目标
 
-Verify that backward dynamics are learnable under oracle terminal conditions:
+验证在 oracle 终点条件下，反向动力学是否可学习：
 
-- Can the video expert generate coherent `x_{t+H} -> x_t`?
-- Can the action expert learn reverse action targets?
-- Does reverse WVWAM remain stable when both video and action are reversed?
+- video expert 能否生成连贯的 `x_{t+H} -> x_t`？
+- action expert 能否学习 reverse action target？
+- 当 video 与 action 都被反转时，reverse WVWAM 是否仍然稳定？
 
-### Engineering Implementation
+### 工程实现
 
-Modify the world training path:
+修改 world training 路径：
 
-- In `wam/trainers/world_train_module.py`, add a `reverse_world_order` branch.
-- Flip `batch["video"]` on time dimension when enabled.
-- Flip `batch["actions"]` on time dimension when enabled.
-- Keep the current diffusion loss unchanged.
-- Ensure sampling/evaluation uses the same ordering as training.
-- Save both reverse comparison and forward-view visualizations.
+- 在 `wam/trainers/world_train_module.py` 中增加 `reverse_world_order` 分支。
+- 开启时沿时间维翻转 `batch["video"]`。
+- 开启时沿时间维翻转 `batch["actions"]`。
+- 保持当前 diffusion loss 不变。
+- 确保 sampling / evaluation 与训练使用相同顺序。
+- 同时保存 reverse comparison 与 forward-view 可视化。
 
-Suggested config fields:
+建议配置字段：
 
 ```yaml
 training:
@@ -118,49 +118,49 @@ training:
   sample_save_forward_view: true
 ```
 
-### Validation Plan
+### 验证方案
 
-- Run a small smoke test, e.g. 100-500 steps.
-- Check `loss_v` and `loss_a` for normal behavior.
-- Track video metrics: PSNR, SSIM, video L1.
-- Track action metrics: action L1/MSE after reversing prediction back to forward order.
-- Compare:
+- 运行小规模 smoke test，例如 100-500 steps。
+- 检查 `loss_v` 与 `loss_a` 是否正常。
+- 跟踪 video metrics: PSNR, SSIM, video L1。
+- 跟踪 action metrics: 将预测翻回正向顺序后的 action L1/MSE。
+- 对比：
   - `reverse_world_order=false`
   - `reverse_world_order=true`
-- Inspect:
+- 人工检查：
   - reverse-view GT vs Pred
   - forward-view GT vs Pred
 
 
-## Stage 2: CoA-Style Semantic Keypoint + Reverse Autoregressive Anchors
+## 阶段 2: CoA 风格语义 Keypoint + 反向自回归锚点
 
-### Scheme Overview
+### 方案概览
 
-Upgrade the Stage 1 oracle reverse WVWAM into a CoA-style semantic-keypoint training setup. The key change is that the terminal anchor is no longer a fixed `t+H`; it is the next semantic keypoint sampled from the episode. The model should learn to generate from a semantic key anchor backward to the current state/action segment.
+将 阶段 1 的 oracle reverse WVWAM 升级为 CoA-style semantic-keypoint 训练设置。关键变化是：终点 anchor 不再固定为 `t+H`，而是从 episode 中采样得到的下一个 semantic keypoint。模型应该学习从 semantic key anchor 向后生成到当前状态 / action segment。
 
-Stage 2 has two training goals:
+阶段 2 有两个训练目标：
 
-- keep reverse video diffusion conditioned on the semantic keyframe clip, so video quality remains comparable to Stage 1;
-- add CoA-style action supervision: the first token in reverse order is the key action, and the action branch learns a teacher-forced reverse-autoregressive auxiliary objective.
+- 保持 reverse video diffusion，并用 semantic keyframe clip 作为条件，使 video 质量能与 阶段 1 对比；
+- 增加 CoA-style action supervision：反向顺序中的第一个 token 是 key action，action branch 学习 teacher-forced reverse-autoregressive auxiliary objective。
 
-### Scheme Details
+### 方案细节
 
-Semantic keypoint sampling:
+Semantic keypoint 采样：
 
-1. Trim static episode heads/tails using the current qpos/action preprocessing.
-2. Discover candidate keypoints:
-   - gripper open/close changes;
-   - low velocity or near-stop boundaries;
-   - episode end as fallback.
-3. Sample a valid pair `(t_start, t_key)` satisfying:
-   - `min_subtrajectory_len <= t_key - t_start <= max_subtrajectory_len`;
-   - keypoints are separated by `keypoint_min_gap`.
-4. Return variable-length clips padded to the existing fixed tensor shape:
-   - `video_forward = x_t, ..., x_key`, padded to `CHUNK_SIZE + 1`;
-   - `action_forward = a_t, ..., a_{key-1}`, padded to `CHUNK_SIZE`;
-   - `video_valid_mask` and `action_valid_mask` mark the real prefix.
+1. 使用当前 qpos/action 预处理裁剪静态 episode 头尾。
+2. 发现候选 keypoint：
+   - gripper 开合变化；
+   - 低速度或近停止边界；
+   - episode end 作为 fallback。
+3. 采样有效 pair `(t_start, t_key)`，满足：
+   - `min_subtrajectory_len <= t_key - t_start <= max_subtrajectory_len`；
+   - keypoints 之间至少间隔 `keypoint_min_gap`。
+4. 返回 variable-length clips，并 pad 到现有固定 tensor 形状：
+   - `video_forward = x_t, ..., x_key`，pad 到 `CHUNK_SIZE + 1`；
+   - `action_forward = a_t, ..., a_{key-1}`，pad 到 `CHUNK_SIZE`；
+   - `video_valid_mask` 与 `action_valid_mask` 标记真实 prefix。
 
-Reverse training view:
+反向训练视角：
 
 ```text
 video_reverse  = x_key, ..., x_t
@@ -174,7 +174,7 @@ decoder input:  SOS, a_key, a_{key-1}, ..., a_{t+1}
 target:         a_key, a_{key-1}, ..., a_t
 ```
 
-In the first engineering version, this is implemented as an auxiliary reverse-AR action loss on top of the existing diffusion action loss:
+第一个工程版本中，该目标实现为 existing diffusion action loss 之上的 auxiliary reverse-AR action loss：
 
 ```text
 loss = loss_reverse_video_diffusion
@@ -183,13 +183,13 @@ loss = loss_reverse_video_diffusion
      + lambda_reverse_ar_action * loss_reverse_ar_action
 ```
 
-`loss_key_action` supervises the first valid reverse action token. `loss_reverse_ar_action` supervises the complete valid reversed action sequence with padding masked out.
+`loss_key_action` 监督第一个有效 reverse action token。`loss_reverse_ar_action` 监督完整有效 reverse action 序列，并屏蔽 padding。
 
-### Loss Function and Current Weights
+### Loss 函数与当前权重
 
-Stage 2 keeps diffusion as the main path and adds reverse-AR action losses as auxiliary supervision.
+阶段 2 保持 diffusion 为主路径，并增加 reverse-AR action loss 作为 auxiliary supervision。
 
-Actual training objective:
+实际训练目标：
 
 ```text
 L_stage2 = L_action_diffusion
@@ -198,26 +198,26 @@ L_stage2 = L_action_diffusion
          + lambda_stage2_reverse_ar_action * L_stage2_reverse_ar_action
 ```
 
-Action diffusion term:
+Action diffusion 项：
 
 ```text
 L_action_diffusion = masked MSE(v_pred_action, target_action)
 ```
 
-Video diffusion term:
+Video diffusion 项：
 
 ```text
 L_video_diffusion = MSE(pred_video, target_video)
 ```
 
-Stage 2 key action term:
+阶段 2 key action 项：
 
 ```text
 reverse_action_gt = a_key, a_{key-1}, ..., a_t
 L_stage2_key_action = masked MSE(pred_reverse_action[:, 0], reverse_action_gt[:, 0])
 ```
 
-Stage 2 reverse-AR action term:
+阶段 2 reverse-AR action 项：
 
 ```text
 decoder_input = SOS, a_key, a_{key-1}, ..., a_{t+1}
@@ -225,24 +225,24 @@ target        = a_key, a_{key-1}, ..., a_t
 L_stage2_reverse_ar_action = masked MSE(pred_reverse_action, target)
 ```
 
-Current runnable config:
+当前可运行配置：
 
 ```text
 validation_tmp/stage2_coa_semantic_reverse_ar.yml
 ```
 
-Current Stage 2 weights:
+当前 阶段 2 权重：
 
 ```yaml
 training:
   reverse_world_order: true
-  generation_mode: diffusion  # implicit default
+  generation_mode: diffusion  # 隐式默认
   stage2_enable_reverse_ar_action: true
   stage2_key_action_loss_weight: 0.1
   stage2_reverse_ar_action_loss_weight: 0.1
 ```
 
-Therefore the logged action loss is:
+因此记录到日志中的 action loss 为：
 
 ```text
 loss_a = L_action_diffusion
@@ -252,51 +252,51 @@ loss_a = L_action_diffusion
 loss_v = L_video_diffusion
 ```
 
-Logged auxiliary metrics:
+记录的辅助指标：
 
 ```text
 loss_stage2_key_action
 loss_stage2_reverse_ar_action
 ```
 
-### Validation Goal
+### 验证目标
 
-Verify that semantic anchors and CoA-style reverse action supervision are useful before replacing the whole action expert inference path:
+在替换整个 action expert inference path 之前，验证 semantic anchor 与 CoA-style reverse action supervision 是否有用：
 
-- Does semantic-keypoint sampling produce meaningful subtrajectory boundaries?
-- Does masked variable-length training remain stable?
-- Does action key prediction improve over training?
-- Does reverse-AR auxiliary action loss decrease without hurting video/action diffusion losses?
-- Are generated forward-view videos still aligned with task progress?
+- semantic-keypoint sampling 是否产生有意义的 subtrajectory boundary？
+- masked variable-length training 是否稳定？
+- action key prediction 是否随训练改善？
+- reverse-AR auxiliary action loss 是否下降，且不损害 video/action diffusion loss？
+- 生成的 forward-view video 是否仍与任务进展对齐？
 
-### Engineering Implementation
+### 工程实现
 
-Dataset:
+数据集：
 
-- Add `data.dataset.subtrajectory_mode: semantic_keypoint`.
-- Return `subtraj_len`, `keypoint_type`, `keypoint_index`.
-- Return `action_valid_mask` and `video_valid_mask`.
-- Pad variable-length action/video prefixes by repeating the last valid step.
+- 增加 `data.dataset.subtrajectory_mode: semantic_keypoint`。
+- 返回 `subtraj_len`, `keypoint_type`, `keypoint_index`。
+- 返回 `action_valid_mask` 与 `video_valid_mask`。
+- 对 variable-length action/video prefix 使用最后一个有效 step 重复 padding。
 
-Train module:
+训练模块：
 
-- Reverse only valid prefixes when `reverse_world_order=true`.
-- Keep padding at the tail after reversal.
-- Pass `action_valid_mask` into action losses.
-- Crop video metrics/visualization to the valid frame count.
+- 当 `reverse_world_order=true` 时，只翻转有效 prefix。
+- 翻转后仍保持 padding 在 tail。
+- 将 `action_valid_mask` 传入 action losses。
+- video metrics / visualization 裁剪到有效 frame count。
 
-Runner/model:
+Runner/模型：
 
-- Keep the existing diffusion reverse video/action path.
-- Add a Stage 2 auxiliary action path controlled by config:
-  - `stage2_enable_reverse_ar_action`;
-  - `stage2_key_action_loss_weight`;
-  - `stage2_reverse_ar_action_loss_weight`.
-- Compute key-action loss on the first valid reverse action token.
-- Compute reverse-AR teacher-forcing action loss on valid action tokens only.
-- Log auxiliary metrics separately from the main diffusion losses.
+- 保留现有 diffusion reverse video/action 路径。
+- 增加由 config 控制的 阶段 2 auxiliary action path：
+  - `stage2_enable_reverse_ar_action`
+  - `stage2_key_action_loss_weight`
+  - `stage2_reverse_ar_action_loss_weight`
+- 在第一个有效 reverse action token 上计算 key-action loss。
+- 只在有效 action token 上计算 reverse-AR teacher-forcing action loss。
+- 将 auxiliary metrics 与主 diffusion loss 分开记录。
 
-Suggested config fields:
+建议配置字段：
 
 ```yaml
 data:
@@ -315,36 +315,36 @@ training:
   stage2_reverse_ar_action_loss_weight: 0.1
 ```
 
-### Validation Plan
+### 验证方案
 
-- Dataset analysis:
-  - keypoints per episode;
-  - subtrajectory length distribution;
-  - keypoint type distribution;
-  - visual examples of extracted keypoint segments.
-- Training smoke test:
-  - verify no empty sample directories during metric-only steps;
-  - verify valid-mask reversal keeps padding at the tail;
-  - verify `loss_stage2_key_action` and `loss_stage2_reverse_ar_action` are logged.
-- Ablations:
-  - fixed horizon + reverse oracle;
-  - semantic keypoint + reverse oracle;
-  - semantic keypoint + Stage 2 auxiliary action losses off;
-  - semantic keypoint + Stage 2 auxiliary action losses on.
-- Metrics:
-  - video PSNR/SSIM/L1 on valid frames;
-  - action L1/MSE on valid steps;
-  - key action L1/MSE;
-  - reverse-AR action L1/MSE.
+- 数据集分析:
+  - 每个 episode 的 keypoint 数量；
+  - subtrajectory length 分布；
+  - keypoint type 分布；
+  - 抽取出来的 keypoint segment 可视化样例。
+- 训练 smoke test：
+  - 验证 metric-only step 不会创建空 sample directory；
+  - 验证 valid-mask reversal 后 padding 仍在 tail；
+  - 验证 `loss_stage2_key_action` 与 `loss_stage2_reverse_ar_action` 被记录。
+- 消融实验：
+  - fixed horizon + reverse oracle；
+  - semantic keypoint + reverse oracle；
+  - semantic keypoint + 阶段 2 auxiliary action losses off；
+  - semantic keypoint + 阶段 2 auxiliary action losses on。
+- 指标：
+  - 有效 frame 上的 video PSNR/SSIM/L1；
+  - 有效 step 上的 action L1/MSE；
+  - key action L1/MSE；
+  - reverse-AR action L1/MSE。
 
 
-## Stage 3: Predicted Key + Reverse Autoregressive Generation
+## 阶段 3: 预测 Key + 反向自回归生成
 
-### Scheme Overview
+### 方案概览
 
-Upgrade Stage 2 from "diffusion main path + reverse-AR auxiliary loss" to a CoA-style generation path where the model first predicts semantic key anchors, then autoregressively generates video/action backward from those anchors.
+将 阶段 2 从 “diffusion main path + reverse-AR auxiliary loss” 升级为 CoA-style generation path：模型先预测 semantic key anchor，再从这些 anchor 开始自回归地向后生成 video/action。
 
-The intended inference chain is:
+目标 inference chain：
 
 ```text
 current observation x_t, state_t, instruction
@@ -353,18 +353,18 @@ current observation x_t, state_t, instruction
   -> reverse generated sequences back to forward order for execution/visualization
 ```
 
-The important engineering constraint is incremental rollback. Stage 3 must be controlled by explicit switches so we can quickly return to:
+重要工程约束是 incremental rollback。阶段 3 必须由显式开关控制，使我们能快速回到：
 
-- earliest diffusion behavior: `generation_mode: diffusion`, `reverse_world_order: false`;
-- Stage 1 oracle reverse diffusion: `generation_mode: diffusion`, `reverse_world_order: true`, fixed horizon;
-- Stage 2 semantic-keypoint reverse diffusion plus auxiliary action AR: `generation_mode: diffusion`, `stage2_enable_reverse_ar_action: true`;
-- Stage 3 reverse-AR action main path: `generation_mode: reverse_ar`, `stage3_replace_action_diffusion: true`.
+- 最早的 diffusion 行为：`generation_mode: diffusion`, `reverse_world_order: false`；
+- 阶段 1 oracle reverse diffusion：`generation_mode: diffusion`, `reverse_world_order: true`, fixed horizon；
+- 阶段 2 semantic-keypoint reverse diffusion + auxiliary action AR：`generation_mode: diffusion`, `stage2_enable_reverse_ar_action: true`；
+- 阶段 3 reverse-AR action main path：`generation_mode: reverse_ar`, `stage3_replace_action_diffusion: true`。
 
-### Scheme Details
+### 方案细节
 
-Stage 3 decomposes generation into key prediction and reverse autoregressive decoding.
+阶段 3 将生成过程拆成 key prediction 与 reverse autoregressive decoding。
 
-Video path:
+Video 路径：
 
 ```text
 keyframe predictor:
@@ -376,7 +376,7 @@ reverse video AR decoder:
   target: z_key, z_{key-1}, ..., z_t
 ```
 
-Action path:
+Action 路径：
 
 ```text
 key action predictor:
@@ -388,13 +388,13 @@ reverse action AR decoder:
   target: a_key, a_{key-1}, ..., a_t
 ```
 
-The Stage 3 action path can reuse the existing action expert if causal self-attention is enabled. The Stage 3 video AR path should not overwrite the existing diffusion video expert. It needs a separate AR decoder path or a clearly gated mode.
+如果启用 causal self-attention，阶段 3 action path 可以复用现有 action expert。阶段 3 video AR path 不应该覆盖现有 diffusion video expert，而应该使用独立 AR decoder path 或清晰的 gated mode。
 
-### Loss Function and Current Weights
+### Loss 函数与当前权重
 
-Stage 3 is designed to replace diffusion with reverse-AR generation. The current implemented code replaces **action diffusion** with reverse-AR action loss, while video still uses diffusion fallback because the video AR decoder has not been implemented yet.
+阶段 3 的目标是用 reverse-AR generation 替代 diffusion。当前已实现代码中，**action diffusion** 已被 reverse-AR action loss 替换；video 仍使用 diffusion fallback，因为 video AR decoder 尚未实现。
 
-Implemented training objective in the current runnable code:
+当前可运行代码中的训练目标：
 
 ```text
 L_stage3_current = L_stage3_action_main + L_stage3_video_diffusion_fallback
@@ -408,14 +408,14 @@ L_stage3_action_main =
   + lambda_stage3_action_ar * L_stage3_reverse_ar_action
 ```
 
-Stage 3 key action term:
+阶段 3 key action 项：
 
 ```text
 reverse_action_gt = a_key, a_{key-1}, ..., a_t
 L_stage3_key_action = masked MSE(pred_reverse_action[:, 0], reverse_action_gt[:, 0])
 ```
 
-Stage 3 reverse-AR action term:
+阶段 3 reverse-AR action 项：
 
 ```text
 decoder_input = SOS, generated_or_teacher_forced_reverse_actions
@@ -423,21 +423,21 @@ target        = a_key, a_{key-1}, ..., a_t
 L_stage3_reverse_ar_action = masked MSE(pred_reverse_action, target)
 ```
 
-Current implementation uses the same teacher-forced reverse-AR action path as Stage 2, but makes it the action main objective instead of an auxiliary objective.
+当前实现复用了 阶段 2 的 teacher-forced reverse-AR action path，但将其作为 action main objective，而不是 auxiliary objective。
 
-Video fallback term:
+Video fallback 项：
 
 ```text
 L_stage3_video_diffusion_fallback = L_video_diffusion
 ```
 
-Current runnable config:
+当前可运行配置：
 
 ```text
 validation_tmp/stage3_predicted_key_reverse_ar.yml
 ```
 
-Current Stage 3 weights used by the running code:
+当前 阶段 3 代码使用的权重：
 
 ```yaml
 training:
@@ -454,9 +454,9 @@ training:
   stage3_video_ar_loss_weight: 1.0
 ```
 
-Because `stage3_replace_video_diffusion=false`, `stage3_keyframe_loss_weight` and `stage3_video_ar_loss_weight` are reserved but not active in the current code.
+因为 `stage3_replace_video_diffusion=false`，`stage3_keyframe_loss_weight` 与 `stage3_video_ar_loss_weight` 当前只是预留字段，尚未在代码中生效。
 
-Therefore the logged losses are:
+因此记录的 loss 为：
 
 ```text
 loss_a = 1.0 * L_stage3_key_action
@@ -465,7 +465,7 @@ loss_a = 1.0 * L_stage3_key_action
 loss_v = L_stage3_video_diffusion_fallback
 ```
 
-Logged Stage 3 metrics:
+记录的 阶段 3 metrics:
 
 ```text
 loss_stage3_key_action
@@ -474,7 +474,7 @@ loss_stage3_action_main
 loss_stage3_video_diffusion_fallback
 ```
 
-Future full Stage 3 objective after video AR decoder is implemented:
+未来实现 video AR decoder 后的 full 阶段 3 objective：
 
 ```text
 L_stage3_full =
@@ -484,7 +484,7 @@ L_stage3_full =
   + lambda_action_ar * L_stage3_reverse_ar_action
 ```
 
-With the planned default weights:
+计划默认权重：
 
 ```text
 lambda_keyframe = 1.0
@@ -493,21 +493,21 @@ lambda_key_action = 1.0
 lambda_action_ar = 1.0
 ```
 
-### Causal Attention Policy
+### Causal Attention 策略
 
-Only the reverse-AR decoders need causal attention:
+只有 reverse-AR decoder 需要 causal attention：
 
-- keyframe predictor: non-causal over condition tokens;
-- key action predictor: non-causal over condition tokens;
-- reverse video AR decoder: causal self-attention over generated video tokens;
-- reverse action AR decoder: causal self-attention over generated action tokens;
-- cross-attention / conditioning tokens: fully visible.
+- keyframe predictor: 对 condition tokens 非 causal；
+- key action predictor: 对 condition tokens 非 causal；
+- reverse video AR decoder: 对生成的 video tokens 使用 causal self-attention；
+- reverse action AR decoder: 对生成的 action tokens 使用 causal self-attention；
+- cross-attention / conditioning tokens: 全部可见。
 
-Do not globally force the original diffusion video expert to be causal. Diffusion denoising predicts the whole noisy sequence in parallel and should keep its existing attention behavior. The Stage 3 video AR path must be gated separately.
+不要全局强制原始 diffusion video expert 使用 causal attention。Diffusion denoising 是并行预测整个 noisy sequence，应保持现有 attention 行为。阶段 3 video AR path 必须单独 gated。
 
-### Engineering Implementation
+### 工程实现
 
-Add Stage 3 switches:
+增加 阶段 3 开关：
 
 ```yaml
 training:
@@ -528,395 +528,596 @@ training:
   stage3_key_teacher_forcing_decay_steps: 20000
 ```
 
-Current incremental implementation:
+当前增量实现：
 
-- `generation_mode=diffusion` keeps Stage 1/Stage 2 behavior unchanged.
-- `generation_mode=reverse_ar` plus `stage3_replace_action_diffusion=true` replaces the action diffusion loss with reverse-AR key/action losses.
-- Stage 3 action-only inference calls the reverse-AR action sampler instead of the action diffusion sampler.
-- `stage3_replace_video_diffusion=false` keeps video diffusion as a fallback while the video AR decoder is developed.
-- `stage3_replace_video_diffusion=true` should fail fast until the video AR decoder is implemented, so we do not silently claim full Stage 3 video replacement.
+- `generation_mode=diffusion` 保持 阶段 1/阶段 2 行为不变。
+- `generation_mode=reverse_ar` 且 `stage3_replace_action_diffusion=true` 时，用 reverse-AR key/action loss 替换 action diffusion loss。
+- 阶段 3 action-only inference 调用 reverse-AR action sampler，而不是 action diffusion sampler。
+- `stage3_replace_video_diffusion=false` 在开发 video AR decoder 时保留 video diffusion 作为 fallback。
+- `stage3_replace_video_diffusion=true` 在 video AR decoder 实现前应 fail fast，避免静默宣称完成 full 阶段 3 video replacement。
 
-Future video implementation:
+未来 video 实现：
 
-- add a keyframe latent prediction head;
-- add a video latent reverse-AR decoder with causal self-attention;
-- compute masked `loss_stage3_keyframe` and `loss_stage3_video_ar`;
-- decode predicted forward-view videos by reversing the generated reverse sequence.
+- 增加 keyframe latent prediction head；
+- 增加带 causal self-attention 的 video latent reverse-AR decoder；
+- 计算 masked `loss_stage3_keyframe` 与 `loss_stage3_video_ar`；
+- 通过反转生成的 reverse sequence 解码 predicted forward-view videos。
 
-### Validation Goal
+### 验证目标
 
-Verify the Stage 3 migration in isolated steps:
+分步骤验证 阶段 3 迁移：
 
-- action reverse-AR can fully replace action diffusion without training crashes;
-- key action and reverse-AR action losses decrease under semantic-keypoint sampling;
-- action-only RoboTwin online evaluation runs through the reverse-AR policy path;
-- video diffusion fallback still preserves Stage 2 visualization/metrics;
-- later, predicted keyframe + video AR can replace video diffusion without degrading forward-view alignment.
+- action reverse-AR 能完全替代 action diffusion 且训练不崩；
+- semantic-keypoint sampling 下 key action 与 reverse-AR action loss 下降；
+- action-only RoboTwin online evaluation 走 reverse-AR policy path；
+- video diffusion fallback 仍保留 阶段 2 的 visualization / metrics；
+- 后续 predicted keyframe + video AR 替换 video diffusion 时，不降低 forward-view 对齐。
 
-### Validation Plan
+### 验证方案
 
-Run ablations with explicit switches:
+使用显式开关运行 ablations：
 
-- original forward/diffusion baseline;
-- Stage 1 fixed-horizon reverse diffusion;
-- Stage 2 semantic-keypoint reverse diffusion with auxiliary AR action on/off;
-- Stage 3 semantic-keypoint reverse-AR action main path with video diffusion fallback;
-- future full Stage 3: reverse-AR video + reverse-AR action.
+- original forward/diffusion baseline；
+- 阶段 1 fixed-horizon reverse diffusion；
+- 阶段 2 semantic-keypoint reverse diffusion，auxiliary AR action on/off；
+- 阶段 3 semantic-keypoint reverse-AR action main path + video diffusion fallback；
+- future full 阶段 3: reverse-AR video + reverse-AR action。
 
-Track:
+跟踪：
 
-- `loss_stage3_key_action`;
-- `loss_stage3_reverse_ar_action`;
-- `loss_stage3_action_main`;
-- `loss_stage3_video_diffusion_fallback`;
-- action L1/MSE on valid tokens after reversing back to forward order;
-- RoboTwin online success rate with `test_num=1`, then `test_num=10`, then multi-task.
+- `loss_stage3_key_action`
+- `loss_stage3_reverse_ar_action`
+- `loss_stage3_action_main`
+- `loss_stage3_video_diffusion_fallback`
+- 翻回正向顺序后的 valid tokens action L1/MSE
+- RoboTwin online success rate：先 `test_num=1`，再 `test_num=10`，最后 multi-task
 
 
-## Stage 4: CoA-Style Semantic Keypoint / Variable-Length Subtrajectory
+## 阶段 3.1: CoA 风格 Action Latent Loss
 
-### Scheme Overview
+### 方案概览
 
-Replace fixed horizon keyframes with CoA-style semantic keypoints. Instead of always using `t+32`, select the next meaningful task-stage boundary as the keyframe.
-
-Candidate keypoint rules:
-
-- gripper state changes
-- joint/action velocity approaches zero
-- episode end
-
-### Scheme Details
-
-For each episode:
-
-1. Randomly choose `t_start`.
-2. Find the next keypoint `t_key`.
-3. Construct a sub-trajectory:
+阶段 3.1 保持当前 阶段 3 结构，但让 action loss 更接近 Chain-of-Action。action expert 仍使用 reverse-AR main path：
 
 ```text
-video:  x_{t_start}, ..., x_{t_key}
-action: a_{t_start}, ..., a_{t_key-1}
+decoder input:  SOS, a_key, a_{key-1}, ..., a_{t+1}
+target:         a_key, a_{key-1}, ..., a_t
 ```
 
-Reverse targets:
+新增部分是 latent consistency term。除了监督 decoded continuous actions，我们还将预测的 reverse actions 与 GT reverse actions 输入 action expert 的 `action_encoder`，并对齐它们的 latent representation。
+
+这是有意设计的增量版本：
+
+- 阶段 1/2 不变，因为它们使用 `generation_mode: diffusion`；
+- 当 `stage3_use_coa_action_loss: false` 时，阶段 3 不变；
+- 阶段 3.1 只通过单独 config 文件与显式开关启用。
+
+### 方案细节
+
+CoA 原始 action training 同时使用：
+
+- decoded actions 上的 action regression loss；
+- predicted latent action tokens 与 encoded GT action tokens 之间的 latent loss。
+
+当前 WVWAM action expert 尚未把独立 CoA decoder latent 暴露为主输出。因此 阶段 3.1 实现最小兼容版本：
 
 ```text
-video_reverse:  x_{t_key}, ..., x_{t_start}
-action_reverse: a_{t_key-1}, ..., a_{t_start}
+pred_latent = action_encoder([pred_reverse_action, action_mask])
+gt_latent   = action_encoder([gt_reverse_action, action_mask])
 ```
 
-Variable-length handling:
+然后计算 masked latent alignment：
 
-- Pad shorter trajectories.
-- Use masks for padded video/action positions.
-- Skip or truncate trajectories longer than a configured max length.
+```text
+L_stage3_action_latent = masked MSE(pred_latent, stopgrad(gt_latent))
+```
 
-### Validation Goal
-
-Test whether semantic anchors are better than fixed horizon anchors:
-
-- Do they improve key prediction?
-- Do they make reverse generation easier?
-- Do they align better with task stages such as grasp/release/place?
-
-### Engineering Implementation
-
-Add keypoint discovery to the dataset:
-
-- Use `observations/qpos` and `action` from RoboTwin HDF5.
-- Detect gripper changes.
-- Detect near-zero joint/action velocity.
-- Always include episode end as a fallback keypoint.
-
-Suggested config fields:
+`stopgrad(gt_latent)` 由以下字段控制：
 
 ```yaml
-data:
-  dataset:
-    subtrajectory_mode: semantic_keypoint  # fixed_horizon | semantic_keypoint
-    keypoint_velocity_threshold: 0.01
-    max_subtrajectory_len: 64
+training:
+  stage3_action_latent_detach_target: true
 ```
 
-Dataset should return:
+这样可以避免在第一次验证时，把 target encoder path 变成双边移动目标。如果该 loss 表现稳定，后续 ablation 可以设置为 `false`。
 
-- `subtraj_len`
-- `keypoint_type`
-- `valid_action_mask`
-- `valid_video_mask`
-- `key_video_frame`
-- `key_action`
-- optionally `key_state`
+### Loss 函数与当前权重
 
-Loss functions must apply masks.
-
-### Loss Function and Current Weights
-
-Stage 4 is primarily a dataset/subtrajectory sampling stage. It does not require a new model loss by itself. The loss depends on which generation mode is paired with semantic keypoint sampling.
-
-If paired with Stage 2:
+当前实现中的 阶段 3.1 objective：
 
 ```text
-L_stage4_with_stage2 =
-    L_action_diffusion
-  + L_video_diffusion
-  + 0.1 * L_stage2_key_action
-  + 0.1 * L_stage2_reverse_ar_action
+L_stage3_1_current =
+    L_stage3_action_main
+  + L_stage3_video_diffusion_fallback
 ```
 
-Current Stage 2 semantic-keypoint config uses:
+其中：
+
+```text
+L_stage3_action_main =
+    lambda_stage3_key_action * L_stage3_key_action
+  + lambda_stage3_action_ar * L_stage3_reverse_ar_action
+  + lambda_stage3_action_latent * L_stage3_action_latent
+```
+
+各项定义：
+
+```text
+L_stage3_key_action =
+  masked MSE(pred_reverse_action[:, 0], reverse_action_gt[:, 0])
+
+L_stage3_reverse_ar_action =
+  masked MSE(pred_reverse_action, reverse_action_gt)
+
+L_stage3_action_latent =
+  masked MSE(
+    action_encoder([pred_reverse_action, action_mask]),
+    stopgrad(action_encoder([reverse_action_gt, action_mask]))
+  )
+
+L_stage3_video_diffusion_fallback =
+  L_video_diffusion
+```
+
+当前可运行配置：
+
+```text
+validation_tmp/stage3_1_coa_action_loss.yml
+```
+
+当前 阶段 3.1 权重：
+
+```yaml
+training:
+  reverse_world_order: true
+  generation_mode: reverse_ar
+  stage3_replace_action_diffusion: true
+  stage3_replace_video_diffusion: false
+  stage3_key_action_loss_weight: 1.0
+  stage3_action_ar_loss_weight: 1.0
+  stage3_use_coa_action_loss: true
+  stage3_action_latent_loss_weight: 0.1
+  stage3_action_latent_detach_target: true
+```
+
+因此：
+
+```text
+loss_a = 1.0 * L_stage3_key_action
+       + 1.0 * L_stage3_reverse_ar_action
+       + 0.1 * L_stage3_action_latent
+
+loss_v = L_stage3_video_diffusion_fallback
+```
+
+记录的 阶段 3.1 metrics：
+
+```text
+loss_stage3_key_action
+loss_stage3_reverse_ar_action
+loss_stage3_action_latent
+loss_stage3_action_main
+loss_stage3_video_diffusion_fallback
+```
+
+### 验证目标
+
+验证加入 CoA-style latent supervision 是否能改善 reverse-AR action path，同时不破坏现有 阶段 3 设置：
+
+- `loss_stage3_action_latent` 应平滑下降；
+- `loss_stage3_key_action` 与 `loss_stage3_reverse_ar_action` 不应明显退化；
+- video metrics 应保持可比，因为 video 仍使用相同 diffusion fallback；
+- 在提高 latent 权重前，RoboTwin online success rate 至少不应差于 阶段 3。
+
+### 工程实现
+
+Config loader：
+
+- 透传 `stage3_use_coa_action_loss`；
+- 透传 `stage3_action_latent_loss_weight`；
+- 透传 `stage3_action_latent_detach_target`。
+
+Runner:
+
+- 复用 阶段 3 teacher-forced reverse-AR action prediction；
+- 与之前一样计算 action regression 与 key-action losses；
+- 当 `stage3_use_coa_action_loss=true` 时，通过 `self.model.action_expert.action_encoder` 计算 latent consistency；
+- 将 `stage3_action_latent_loss_weight * loss_stage3_action_latent` 加入 `loss_stage3_action_main`；
+- 单独记录 latent loss。
+
+这还不是完整的 CoA decoder-latent 实现。完整版本会暴露 action decoder 在 action decoding 前的 latent prediction，并直接在该 hidden state 上计算 latent loss。阶段 3.1 是一个低风险桥接版本，可以立刻用当前 action expert 测试。
+
+### 验证方案
+
+用相同 seed/checkpoint 设置运行 阶段 3 与 阶段 3.1 配置：
+
+```text
+validation_tmp/stage3_predicted_key_reverse_ar.yml
+validation_tmp/stage3_1_coa_action_loss.yml
+```
+
+对比：
+
+- `loss_stage3_key_action`
+- `loss_stage3_reverse_ar_action`
+- `loss_stage3_action_latent`
+- valid tokens 上的 action L1/MSE
+- 首先在 `place_empty_cup` 上测试 RoboTwin online success rate
+- 如果单任务 success rate 不差，再扩展到更多 RoboTwin tasks
+
+消融实验：
+
+```yaml
+stage3_action_latent_loss_weight: 0.0
+stage3_action_latent_loss_weight: 0.1
+stage3_action_latent_loss_weight: 1.0
+stage3_action_latent_detach_target: true
+stage3_action_latent_detach_target: false
+```
+
+
+## 阶段 4: 完整 CoA 风格反向自回归 WVWAM
+
+### 方案概览
+
+阶段 4 直接将 video generation 与 action generation 都替换为 CoA-style reverse autoregressive 范式。semantic-keypoint sampler 不再作为单独研究阶段，因为它已经被 阶段 2 / 阶段 3 吸收：
 
 ```yaml
 data:
   dataset:
     subtrajectory_mode: semantic_keypoint
-    min_subtrajectory_len: 4
-    max_subtrajectory_len: 32
-    keypoint_min_gap: 5
-    keypoint_velocity_threshold: 0.01
-    keypoint_gripper_threshold: 0.1
-
-training:
-  generation_mode: diffusion
-  stage2_key_action_loss_weight: 0.1
-  stage2_reverse_ar_action_loss_weight: 0.1
 ```
 
-If paired with current Stage 3:
+阶段 4 的目标更强：
 
 ```text
-L_stage4_with_stage3_current =
-    1.0 * L_stage3_key_action
-  + 1.0 * L_stage3_reverse_ar_action
-  + L_stage3_video_diffusion_fallback
+current observation x_t, state_t, instruction
+  -> predict semantic key video/action anchors
+  -> reverse-AR generate video x_key -> ... -> x_t
+  -> reverse-AR generate action a_key -> ... -> a_t
+  -> flip generated video/action back to forward order
+  -> execute forward actions in RoboTwin
 ```
 
-In both cases, all action/video sequence losses must use `action_valid_mask` / `video_valid_mask` so padded steps do not contribute.
+在该阶段，`L_video_diffusion` 与 `L_action_diffusion` 都不应再属于 main training objective。Diffusion 仍可作为 fallback path 保留在代码中，但 阶段 4 config 应禁用两个 diffusion replacement fallback。
 
-### Validation Plan
+### 方案细节
 
-First run dataset-level analysis:
-
-- number of keypoints per episode
-- subtrajectory length distribution
-- keypoint type distribution
-- examples of extracted keypoint segments
-
-Then compare:
-
-- fixed horizon + GT key
-- semantic keypoint + GT key
-- fixed horizon + predicted key
-- semantic keypoint + predicted key
-
-Metrics:
-
-- key video/action error
-- video PSNR/SSIM/L1
-- action L1/MSE
-- qualitative task-stage consistency
-
-
-## Stage 5: Action Expert CoA-Style Autoregressive Reverse Decoder
-
-### Scheme Overview
-
-This is the closest version to CoA. The action expert no longer only denoises a full reversed action chunk. Instead, it autoregressively generates reversed continuous action tokens:
+训练数据仍使用 CoA-style semantic subtrajectories：
 
 ```text
-SOS -> key action
-SOS + key action -> previous action
-SOS + key action + previous action -> earlier action
+forward video:  x_t, ..., x_key
+forward action: a_t, ..., a_{key-1}
+
+reverse video:  x_key, ..., x_t
+reverse action: a_key, ..., a_t
 ```
 
-After generation, reverse the predicted sequence back to forward order for execution.
-
-### Scheme Details
-
-Given forward actions:
+模型学习四个相互关联的预测：
 
 ```text
-a_1, ..., a_T
+1. video key anchor:
+   input:  instruction + current observation x_t + state_t
+   target: z_key = VAE(x_key)
+
+2. action key anchor:
+   input:  instruction + current observation x_t + state_t
+   target: a_key
+
+3. reverse video AR:
+   input:  SOS_video, z_key, z_{key-1}, ..., z_{t+1}
+   target: z_key, z_{key-1}, ..., z_t
+
+4. reverse action AR:
+   input:  SOS_action, a_key, a_{key-1}, ..., a_{t+1}
+   target: a_key, a_{key-1}, ..., a_t
 ```
 
-Encode:
+对 video 而言，AR target 应在 VAE latent space 中计算，而不是 pixel space：
 
 ```text
-x_i = action_encoder(a_i)
+z_i = VAE.encode(x_i)
 ```
 
-Reverse:
+这样可以让 video loss 计算可控，并与当前 video expert interface 保持一致。
+
+对 action 而言，阶段 4 应以 阶段 3.1 action objective 作为起点：
 
 ```text
-x_rev = x_T, ..., x_1
+decoded action regression + action latent consistency
 ```
 
-Decoder input:
+### Loss 函数与初始权重
+
+阶段 4 从主 objective 中移除 diffusion：
 
 ```text
-SOS, x_T, ..., x_2
+L_stage4 =
+    lambda_keyframe * L_stage4_keyframe
+  + lambda_video_ar * L_stage4_video_ar
+  + lambda_key_action * L_stage4_key_action
+  + lambda_action_ar * L_stage4_action_ar
+  + lambda_action_latent * L_stage4_action_latent
 ```
 
-Target:
+Video keyframe loss：
 
 ```text
-x_T, ..., x_1
+L_stage4_keyframe =
+  masked MSE(pred_z_key, z_key)
 ```
 
-Loss:
+Reverse video AR loss：
 
 ```text
-L_reg = || action_decoder(x_hat_rev) - action_rev ||
-L_latent = || x_hat_rev - action_encoder(action_rev) ||
-L_total = L_reg + lambda * L_latent
+decoder_input_video = SOS_video, z_key, z_{key-1}, ..., z_{t+1}
+target_video        = z_key, z_{key-1}, ..., z_t
+
+L_stage4_video_ar =
+  masked MSE(pred_z_reverse, target_video)
 ```
 
-Optional MTP:
-
-At each reverse decoding step, predict the next `K` reversed tokens for local continuity. Use MTP only during training.
-
-### Loss Function and Current Weights
-
-Stage 5 is a future stronger action expert variant. It is not the currently running Stage 3 implementation. The currently running Stage 3 action AR loss is simpler:
+Action key loss：
 
 ```text
-L_stage3_action_main =
-    1.0 * masked MSE(pred_reverse_action[:, 0], reverse_action_gt[:, 0])
-  + 1.0 * masked MSE(pred_reverse_action, reverse_action_gt)
+L_stage4_key_action =
+  masked MSE(pred_reverse_action[:, 0], reverse_action_gt[:, 0])
 ```
 
-The proposed Stage 5 latent-decoder version would use:
+Reverse action AR loss：
 
 ```text
-L_stage5 =
-    lambda_reg * L_reg
-  + lambda_latent * L_latent
-  + lambda_mtp * L_mtp
+decoder_input_action = SOS_action, a_key, a_{key-1}, ..., a_{t+1}
+target_action        = a_key, a_{key-1}, ..., a_t
+
+L_stage4_action_ar =
+  masked MSE(pred_reverse_action, target_action)
 ```
 
-Where:
+Action latent consistency：
 
 ```text
-L_reg = masked MSE(action_decoder(x_hat_rev), action_rev)
-L_latent = masked MSE(x_hat_rev, stopgrad(action_encoder(action_rev)))
-L_mtp = optional multi-token prediction loss over the next K reverse tokens
+L_stage4_action_latent =
+  masked MSE(
+    action_encoder([pred_reverse_action, action_mask]),
+    stopgrad(action_encoder([target_action, action_mask]))
+  )
 ```
 
-Recommended initial weights for a future Stage 5 config:
+阶段 4 初始权重：
 
 ```yaml
 training:
-  action_generation_mode: reverse_ar
-  stage5_reg_loss_weight: 1.0
-  stage5_latent_loss_weight: 0.1
-  stage5_mtp_loss_weight: 0.0
+  generation_mode: reverse_ar
+  stage4_full_coa_ar: true
+  stage4_replace_video_diffusion: true
+  stage4_replace_action_diffusion: true
+  stage4_keyframe_loss_weight: 1.0
+  stage4_video_ar_loss_weight: 1.0
+  stage4_key_action_loss_weight: 1.0
+  stage4_action_ar_loss_weight: 1.0
+  stage4_action_latent_loss_weight: 0.1
 ```
 
-Then enable MTP only after the base AR decoder is stable:
+可选 warm-start 权重：
+
+```yaml
+weights:
+  wam: checkpoints/validation-stage3-1-coa-action-loss/checkpoint-*
+```
+
+### Causal Attention 策略
+
+阶段 4 只应对生成的 AR tokens 使用 causal attention：
+
+- video reverse-AR tokens 使用 causal mask；
+- action reverse-AR tokens 使用 causal mask；
+- language tokens 完全可见；
+- current visual observation tokens 完全可见；
+- current state tokens 完全可见；
+- cross-modal conditioning 完全可见。
+
+不要对原始 diffusion video expert 应用全局 causal mask。阶段 4 应增加一个单独 gated 的 video AR decoder path，并保留旧 video diffusion path 以便 rollback。
+
+### 工程实现
+
+增加 阶段 4 开关：
 
 ```yaml
 training:
-  stage5_mtp_loss_weight: 0.1
-  stage5_mtp_horizon: 4
+  stage4_full_coa_ar: true
+  stage4_replace_video_diffusion: true
+  stage4_replace_action_diffusion: true
+  stage4_video_ar_causal_attention: true
+  stage4_action_ar_causal_attention: true
 ```
 
-### Validation Goal
+Runner 修改：
 
-Test whether CoA-style global-to-local action generation outperforms diffusion reverse action generation:
+- 增加 `compute_loss_stage4_full_coa_ar`；
+- 仅当 `stage4_full_coa_ar=true` 时路由到该函数；
+- 不调用 `_compute_video_diffusion_loss`；
+- 不采样 action diffusion noise；
+- 按 `train_world.py` 当前外部接口返回 `loss_action`, `loss_video` 与可选 `loss_value`；
+- 单独记录所有 阶段 4 loss 项。
 
-- better action smoothness
-- better long-horizon stability
-- better spatial generalization
-- lower closed-loop correction burden
+Video expert 修改：
 
-### Engineering Implementation
+- 当前 Stage 4 v0 已增加一个独立的轻量 latent-level video AR head；
+- 已增加 `stage4_video_sos` 作为 video AR 的 SOS token；
+- 当前 teacher-forced video AR training 使用 `SOS_video, z_key, z_{key-1}, ...` 预测 `z_key, z_{key-1}, ...`；
+- 当前 inference-time video rollout 逐帧自回归生成 reverse video latent；
+- 后续可将轻量 video AR head 替换为更强的 transformer-style video AR decoder；
+- 使用现有 VAE 解码生成 latent sequence 以做可视化。
 
-In `wam/models/mvwam/action_expert.py`, add an AR action mode:
+Action expert 修改：
 
-```yaml
-architecture:
-  model:
-    action_generation_mode: reverse_ar  # diffusion | reverse_ar
-```
+- 保留 阶段 3 reverse-AR action path；
+- 保留 阶段 3.1 latent consistency；
+- 后续可选择暴露 action decoder latent，以更接近原始 CoA 实现。
 
-Potential components:
+Sampling / inference 修改：
 
-- `sos_action_token`
-- causal decoder path
-- latent output before action decoding
-- reuse existing `action_encoder`
-- reuse existing `action_decoder`
-- add latent consistency loss
-- optional MTP heads
+- 从当前 observation 预测 `z_key` 与 `a_key`；
+- 自回归 rollout reverse video 与 reverse action；
+- 将生成序列翻回正向时间；
+- 同时保存 reverse-view 与 forward-view videos；
+- RoboTwin 中只执行 forward actions。
 
-Runner additions:
-
-- `compute_loss_reverse_ar_action`
-- `predict_action_reverse_ar`
-
-Inference:
+建议配置：
 
 ```text
-H = [SOS]
-while not stop:
-    x_hat = decoder(H | observation)
-    H.append(x_hat)
-    a_hat = action_decoder(x_hat)
-    if distance(a_hat, current_state) < threshold:
-        break
-
-actions_reverse = decode(H[1:])
-actions_forward = reverse(actions_reverse)
+validation_tmp/stage4_full_coa_reverse_ar.yml
 ```
+
+### 验证目标
+
+验证 fully AR WVWAM 是否能够替换两个 diffusion experts：
+
+- video AR loss 在没有 diffusion fallback 的情况下下降；
+- action AR 与 action latent losses 保持稳定；
+- 生成的 forward-view videos 展示从 `x_t` 到 `x_key` 的任务进展；
+- 预测的 action chunks 可在 RoboTwin 中执行；
+- warm start 后 online success rate 不差于 阶段 3.1。
+
+### 验证方案
+
+先做 offline 验证：
+
+- 在 tiny subset 上跑 10-50 step overfit test；
+- 验证 `loss_stage4_keyframe`, `loss_stage4_video_ar`, `loss_stage4_key_action`, `loss_stage4_action_ar`, `loss_stage4_action_latent` 都是 finite；
+- 检查 predicted video latent shape 与 decoded mp4 shape；
+- 检查 reverse-view 与 forward-view videos；
+- 对比有效 tokens 上的 action L1/MSE。
+
+然后对比：
+
+- 阶段 3.1: action AR + video diffusion fallback；
+- 阶段 4 action-only AR，关闭 video AR；
+- 阶段 4 video-only AR，关闭 action AR；
+- 阶段 4 full video/action AR。
+
+在线验证：
+
+- 首先 `place_empty_cup`, `test_num=1`；
+- 然后 `place_empty_cup`, `test_num=10`；
+- 再跑一个小规模 multi-task suite；
+- 跟踪 success rate, episode length, action smoothness 与 failure type。
+
+
+## 阶段 5: 闭环 CoA 执行与动态重规划
+
+### 方案概览
+
+阶段 5 从 offline full CoA-style generation 走向 closed-loop robot execution。阶段 4 生成完整 reverse-AR video/action chunks。阶段 5 决定如何在 RoboTwin 中安全执行这些 chunks：
+
+```text
+observe -> predict key anchors -> generate reverse chunk -> flip to forward chunk
+        -> execute a short prefix -> observe again -> replan
+```
+
+核心变化不是新的 loss，而是 deployment strategy：每次只执行一小段 forward action prefix，然后重新观测并生成新的 CoA-style chunk。
+
+### 方案细节
+
+阶段 5 应支持：
+
+- receding-horizon execution；
+- 基于 state/action distance 的 dynamic stop；
+- overlapping chunks 上的 optional temporal ensemble；
+- 多任务 online success-rate evaluation。
 
 Dynamic stop:
 
-- For joint-space RoboTwin, use distance between decoded action/state and current qpos.
-- Include gripper consistency if useful.
-
-### Validation Plan
-
-Offline:
-
-- action L1/MSE
-- latent consistency loss
-- dynamic stop length distribution
-- trajectory smoothness
-
-Compare:
-
-- diffusion forward action
-- diffusion reverse action
-- AR reverse action
-- fixed horizon vs semantic keypoint
-- GT key vs predicted key
-
-Online/closed-loop:
-
-- Generate a segment.
-- Execute the first few actions.
-- Re-observe.
-- Replan.
-
-Optional:
-
-- reverse temporal ensemble to smooth overlapping predicted trajectories.
-
-
-## Recommended Implementation Order
-
-1. Stage 1: oracle reverse WVWAM.
-2. Stage 2: key video/action prediction.
-3. Stage 3: predicted key conditioning via scheduled sampling.
-4. Stage 4: semantic keypoint extraction and variable-length sub-trajectories.
-5. Stage 5: CoA-style autoregressive reverse action decoder.
-
-Do not start with Stage 5. It changes the action expert training paradigm. First prove:
-
 ```text
-GT key reverse generation works.
-Predicted key quality is acceptable.
-Predicted key reverse generation works.
+stop if || predicted_state_or_action - current_qpos || < threshold
 ```
 
-Then upgrade action generation from diffusion reverse chunking to CoA-style autoregressive reverse decoding.
+对 RoboTwin 而言，stop rule 应包括：
+
+- arm joint distance；
+- gripper state consistency；
+- maximum executed prefix length；
+- 如果环境已经 success，则 early termination。
+
+### Loss 函数与当前权重
+
+阶段 5 使用训练好的 阶段 4 model。默认没有新的 offline training loss：
+
+```text
+L_stage5 = L_stage4
+```
+
+如果后续加入 execution-aware fine-tuning，可增加：
+
+```text
+L_stage5_online =
+    L_stage4
+  + lambda_success * L_success_proxy
+  + lambda_smooth * L_action_smoothness
+```
+
+初始 deployment config：
+
+```yaml
+inference:
+  execution_mode: receding_horizon
+  execute_prefix_len: 4
+  replan_every: 4
+  dynamic_stop: true
+  dynamic_stop_qpos_threshold: 0.03
+  temporal_ensemble: false
+```
+
+### 工程实现
+
+RoboTwin success-rate module:
+
+- 加载 阶段 4 checkpoint；
+- 从 RoboTwin camera/state 构造当前 observation tokens；
+- 调用 阶段 4 full CoA AR inference；
+- 将生成的 action sequence 翻回正向顺序；
+- denormalize actions；
+- 执行 `execute_prefix_len` 个 actions；
+- 重新观测并 replan，直到 success、failure 或达到 max episode length。
+
+日志记录：
+
+- success rate；
+- episode length；
+- number of replans；
+- action smoothness；
+- failure type；
+- 可选：只为失败 episode 或 debug episode 保存 mp4。
+
+### 验证方案
+
+从以下设置开始：
+
+- `place_empty_cup`, `test_num=1`；
+- `place_empty_cup`, `test_num=10`；
+- 对比 阶段 3.1、阶段 4 与 阶段 5 receding-horizon execution。
+
+然后扩展到：
+
+- pick/place tasks；
+- articulated object tasks；
+- long-horizon multi-stage tasks。
+
+
+## 推荐实现顺序
+
+1. 阶段 1: oracle reverse WVWAM。
+2. 阶段 2: semantic-keypoint reverse diffusion + auxiliary reverse-AR action。
+3. 阶段 3: predicted-key reverse-AR action main path + video diffusion fallback。
+4. 阶段 3.1: 在 阶段 3 上增加 CoA-style action latent loss。
+5. 阶段 4: 对 video 与 action 都做 full CoA-style reverse-AR replacement。
+6. 阶段 5: closed-loop CoA execution 与 dynamic replanning。
+
+不要把 阶段 4 静默合并进现有 diffusion video expert。阶段 4 应该是带开关的 gated path，并具有独立 video AR decoder，这样我们仍然可以随时回到：
+
+```text
+阶段 1 diffusion reverse oracle
+阶段 2 semantic-keypoint reverse diffusion
+阶段 3/3.1 action AR + video diffusion fallback
+```
