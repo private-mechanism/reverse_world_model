@@ -22,6 +22,10 @@ from torchvision import transforms
 
 from configs.model_config_loader import load_model_config_dict
 from data.helpers import expand2square_pil
+from data.helpers import (
+    preprocess_video_chw_for_training,
+    video_metas_nhwc_to_chw_float_tensor,
+)
 from data.hdf5_dataset_128dim import fallback_separate_statistics_path
 from wam.models.multimodal_encoder.siglip2_encoder import SiglipVisionTower
 from wam.models.multimodal_encoder.umt5_encoder import umT5Embedder
@@ -48,6 +52,8 @@ class RoboTwinDeployConfig:
     eval_steps_per_call: int = 1
     num_inference_timesteps: Optional[int] = 5
     camera_keys: Sequence[str] = DEFAULT_CAMERA_KEYS
+    video_camera_key: str = "head_camera"
+    video_num_frames: Optional[int] = None
     instruction: Optional[str] = None
 
     @classmethod
@@ -76,6 +82,8 @@ class RoboTwinDeployConfig:
             eval_steps_per_call=int(getter("eval_steps_per_call", 1)),
             num_inference_timesteps=_optional_int(getter("num_inference_timesteps", 5)),
             camera_keys=tuple(camera_keys),
+            video_camera_key=str(getter("video_camera_key", "head_camera")),
+            video_num_frames=_optional_int(getter("video_num_frames", None)),
             instruction=getter("instruction", None),
         )
 
@@ -225,6 +233,7 @@ class WVWAMRoboTwinPolicy:
         self.norm_minmax = bool(self.common.get("norm_minmax", False))
         self.image_size = self.dataset_cfg.get("video_size") or self.dataset_cfg.get("image_size")
         self.image_aspect_ratio = self.dataset_cfg.get("image_aspect_ratio", "pad")
+        self.pred_video_num_cameras = int(self.dataset_cfg.get("num_cameras", 1))
         self.action_queue: Deque[np.ndarray] = deque()
         self.steps_since_replan = 0
 
@@ -275,6 +284,14 @@ class WVWAMRoboTwinPolicy:
             )
         self.state_stats = self.statistics.get("state") if self.statistics else None
         self.action_stats = self.statistics.get("action") if self.statistics else None
+        self.vae = None
+        if not self.deploy_config.action_only:
+            from wam.models.multimodal_encoder.vae_encoder import VAEEncoder
+
+            self.vae = VAEEncoder(self.model_config["VIDEO_BASE_MODEL"])
+            self.vae.model = self.vae.model.to(
+                self.device, dtype=self.weight_dtype
+            )
 
     def reset(self) -> None:
         self.action_queue.clear()
@@ -314,6 +331,73 @@ class WVWAMRoboTwinPolicy:
         action_mask = torch.from_numpy(mask).to(self.device, dtype=self.weight_dtype).view(1, 1, -1)
         return state_tokens, action_mask
 
+    def _build_video_condition(
+        self, observation: Mapping[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode the current camera frame and build a reverse-view latent template."""
+        if self.vae is None:
+            raise RuntimeError("Video conditioning requires action_only=false.")
+        if self.pred_video_num_cameras == 3:
+            camera_keys = tuple(self.deploy_config.camera_keys)
+            if len(camera_keys) < 3:
+                raise ValueError(
+                    "Three-camera video conditioning requires three camera_keys."
+                )
+            # Training stitches [high, left wrist, right wrist].
+            video_metas = [
+                _extract_rgb(observation, camera_keys[0])[None],
+                _extract_rgb(observation, camera_keys[2])[None],
+                _extract_rgb(observation, camera_keys[1])[None],
+            ]
+        elif self.pred_video_num_cameras == 1:
+            video_metas = [
+                _extract_rgb(
+                    observation, self.deploy_config.video_camera_key
+                )[None]
+            ]
+        else:
+            raise ValueError(
+                f"Unsupported video camera count: {self.pred_video_num_cameras}"
+            )
+        video_frames = video_metas_nhwc_to_chw_float_tensor(video_metas)
+        processed = preprocess_video_chw_for_training(
+            video_frames,
+            self.vision_encoder.image_processor,
+            tuple(self.dataset_cfg["video_size"]),
+            image_size=self.dataset_cfg.get("image_size"),
+            image_aug=False,
+            auto_adjust_image_brightness=False,
+            sample_image_aug_type_fn=lambda: "mixed",
+        )
+        current_frame = (
+            processed.permute(1, 0, 2, 3)
+            .unsqueeze(0)
+            .to(self.device, dtype=self.weight_dtype)
+        )
+        current_latent = self.vae.encode_to_latents(current_frame)
+        num_video_frames = (
+            int(self.deploy_config.video_num_frames)
+            if self.deploy_config.video_num_frames is not None
+            else self.action_chunk_size + 1
+        )
+        latent_frames = 1 + max(0, num_video_frames - 1) // 4
+        batch_size, channels, _one, height, width = current_latent.shape
+        video_latents = current_latent.new_zeros(
+            batch_size, channels, latent_frames, height, width
+        )
+        # Goal-conditioned reverse inference reads the current frame from the
+        # final temporal slot and predicts the horizon key at slot zero.
+        video_latents[:, :, -1:] = current_latent[:, :, :1]
+        mask_channels = int(self.vae.model.config.scale_factor_temporal)
+        condition_video_latents = current_latent.new_zeros(
+            batch_size,
+            mask_channels + channels,
+            latent_frames,
+            height,
+            width,
+        )
+        return video_latents, condition_video_latents
+
     def _instruction_from_env(
         self,
         task_env: Optional[Any],
@@ -349,6 +433,13 @@ class WVWAMRoboTwinPolicy:
         img_tokens = self._build_image_tokens(observation)
         state_tokens, action_mask = self._build_state_tokens(observation)
         ctrl_freqs = torch.tensor([self.deploy_config.control_freq], device=self.device, dtype=torch.long)
+        if self.deploy_config.action_only:
+            video_latents = None
+            condition_video_latents = None
+        else:
+            video_latents, condition_video_latents = self._build_video_condition(
+                observation
+            )
 
         out = self.model.predict_action(
             lang_tokens=lang_tokens,
@@ -357,15 +448,15 @@ class WVWAMRoboTwinPolicy:
             state_tokens=state_tokens,
             action_mask=action_mask,
             ctrl_freqs=ctrl_freqs,
-            video_latents=None,
-            condition_video_latents=None,
+            video_latents=video_latents,
+            condition_video_latents=condition_video_latents,
             action_only=self.deploy_config.action_only,
             video_only=False,
             sample_batch_size=1,
             num_inference_timesteps=self.deploy_config.num_inference_timesteps,
         )
         pred = out["pred_trajectory"].detach().float().cpu().numpy()[0]
-        if self.reverse_world_order:
+        if self.reverse_world_order and out.get("trajectory_order") != "forward":
             pred = pred[::-1].copy()
         if self.norm_minmax:
             pred = _denormalize_minmax(pred, self.action_stats)
@@ -428,6 +519,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_steps_per_call", type=int, default=1)
     parser.add_argument("--num_inference_timesteps", type=int, default=5)
     parser.add_argument("--camera_keys", default="head_camera,right_camera,left_camera")
+    parser.add_argument("--video_camera_key", default="head_camera")
+    parser.add_argument("--video_num_frames", type=int, default=None)
     parser.add_argument("--instruction", default=None)
     return parser
 

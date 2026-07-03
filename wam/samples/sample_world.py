@@ -334,8 +334,53 @@ def log_sample_res(
                     video_only=False,
                 )
                 pred_actions = out["pred_trajectory"]
+                pred_actions_for_metric = out.get("pred_reverse_trajectory")
+                if pred_actions_for_metric is None:
+                    pred_actions_for_metric = pred_actions
                 pred_video = out["pred_video"]
+                pred_key_video = out.get("pred_key_video")
+                pred_key_action = out.get("pred_key_action")
                 pred_value = out["pred_value"]
+                if pred_key_video is not None and video_latents is not None:
+                    key_video_l1 = F.l1_loss(
+                        pred_key_video, video_latents[:, :, :1]
+                    )
+                    loss_for_log[
+                        log_key_prefix + "overall_avg_sample_key_video_latent_l1"
+                    ] += _reduce_metric(
+                        accelerator,
+                        key_video_l1,
+                        distributed_reduce=distributed_reduce,
+                    )
+                if pred_key_action is not None:
+                    key_len = min(pred_key_action.shape[1], actions.shape[1])
+                    key_mask = state_elem_mask[:, None, :].expand(
+                        -1, key_len, -1
+                    ).float()
+                    if action_valid_mask is not None:
+                        key_mask = key_mask * action_valid_mask[
+                            :, :key_len, None
+                        ].float()
+                    key_diff = (
+                        pred_key_action[:, :key_len] - actions[:, :key_len]
+                    ).float()
+                    key_denom = key_mask.sum().clamp_min(1.0)
+                    key_mse = (key_diff.square() * key_mask).sum() / key_denom
+                    key_l1 = (key_diff.abs() * key_mask).sum() / key_denom
+                    loss_for_log[
+                        log_key_prefix + "overall_avg_sample_key_action_mse"
+                    ] += _reduce_metric(
+                        accelerator,
+                        key_mse,
+                        distributed_reduce=distributed_reduce,
+                    )
+                    loss_for_log[
+                        log_key_prefix + "overall_avg_sample_key_action_l1"
+                    ] += _reduce_metric(
+                        accelerator,
+                        key_l1,
+                        distributed_reduce=distributed_reduce,
+                    )
                 if pred_video is not None and video_latents is not None:
                     latent_l1_loss = latent_l1(pred_video, video_latents)
                     latent_l1_scaler = _reduce_metric(
@@ -415,13 +460,13 @@ def log_sample_res(
                         video_latents_pred=pred_video,
                     )
 
-                num_steps = pred_actions.shape[1]
+                num_steps = pred_actions_for_metric.shape[1]
                 expanded_state_elem_mask = (state_elem_mask.unsqueeze(1).tile((1, num_steps, 1)).float())
                 if action_valid_mask is not None:
                     expanded_state_elem_mask = expanded_state_elem_mask * action_valid_mask[:, :num_steps, None].float()
 
-                loss = F.mse_loss(pred_actions, actions, reduction="none").float()
-                l1_elem = (pred_actions - actions).abs().float()
+                loss = F.mse_loss(pred_actions_for_metric, actions, reduction="none").float()
+                l1_elem = (pred_actions_for_metric - actions).abs().float()
 
                 mse_loss = (loss * expanded_state_elem_mask).sum() / expanded_state_elem_mask.sum()
                 mse_loss_scaler = _reduce_metric(
@@ -436,7 +481,8 @@ def log_sample_res(
                 )
                 loss_for_log[log_key_prefix + "overall_avg_sample_l1"] += l1_loss_scaler
                 loss_for_log[log_key_prefix + "overall_avg_sample_action_l1"] += l1_loss_scaler
-                del out, pred_actions, pred_video, pred_value, loss, l1_elem
+                del out, pred_actions, pred_actions_for_metric, pred_video
+                del pred_key_video, pred_key_action, pred_value, loss, l1_elem
 
             if sync_each_batch:
                 accelerator.wait_for_everyone()
@@ -453,6 +499,9 @@ def log_sample_res(
             "overall_avg_sample_action_mse",
             "overall_avg_sample_action_l1",
             "overall_avg_sample_latent_l1",
+            "overall_avg_sample_key_video_latent_l1",
+            "overall_avg_sample_key_action_mse",
+            "overall_avg_sample_key_action_l1",
             "overall_avg_sample_video_l1",
             "overall_avg_sample_video_psnr",
             "overall_avg_sample_video_ssim",
@@ -464,6 +513,9 @@ def log_sample_res(
                 "AE_overall_avg_sample_action_mse",
                 "AE_overall_avg_sample_action_l1",
                 "AE_overall_avg_sample_latent_l1",
+                "AE_overall_avg_sample_key_video_latent_l1",
+                "AE_overall_avg_sample_key_action_mse",
+                "AE_overall_avg_sample_key_action_l1",
                 "AE_overall_avg_sample_video_l1",
                 "AE_overall_avg_sample_video_psnr",
                 "AE_overall_avg_sample_video_ssim",

@@ -28,7 +28,7 @@ import torch.nn as nn
 import transformers
 import yaml
 from accelerate import Accelerator
-from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration, set_seed
+from accelerate.utils import DeepSpeedPlugin, DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from diffusers.utils import is_wandb_available
 from huggingface_hub import create_repo, upload_folder
 from omegaconf import OmegaConf
@@ -542,6 +542,7 @@ def train(args, logger):
     vae.model.to(encoder_device, dtype=weight_dtype)
 
     accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         deepspeed_plugin=(DeepSpeedPlugin(hf_ds_config=args.deepspeed) if args.deepspeed is not None else None),
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -549,6 +550,7 @@ def train(args, logger):
         log_with=args.report_to,
         project_dir=logging_dir,
         project_config=accelerator_project_config,
+        kwargs_handlers=[ddp_kwargs],
     )
 
     if args.report_to == "wandb":
@@ -865,12 +867,13 @@ def train(args, logger):
     lr_scheduler = accelerator.prepare(lr_scheduler)
 
     if accelerator.is_main_process:
+        tracker_init_kwargs = {}
+        if args.report_to == "wandb":
+            tracker_init_kwargs["wandb"] = {"name": f"{args.CONFIG_NAME}"}
         accelerator.init_trackers(
             model_config.get("WANB_PROJECT_NAME", "VLA"),
             config=vars(args),
-            init_kwargs={"wandb": {
-                "name": f"{args.CONFIG_NAME}",
-            }},
+            init_kwargs=tracker_init_kwargs,
         )
         if args.report_to == "wandb":
             import wandb
@@ -1067,7 +1070,8 @@ def train(args, logger):
                     "loss_v": loss_video.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                 }
-                stage2_metrics = getattr(train_module.model, "last_stage2_metrics", None)
+                metric_model = accelerator.unwrap_model(train_module.model)
+                stage2_metrics = getattr(metric_model, "last_stage2_metrics", None)
                 if stage2_metrics:
                     logs.update(
                         {
@@ -1075,7 +1079,7 @@ def train(args, logger):
                             for key, value in stage2_metrics.items()
                         }
                     )
-                stage3_metrics = getattr(train_module.model, "last_stage3_metrics", None)
+                stage3_metrics = getattr(metric_model, "last_stage3_metrics", None)
                 if stage3_metrics:
                     logs.update(
                         {
@@ -1083,12 +1087,22 @@ def train(args, logger):
                             for key, value in stage3_metrics.items()
                         }
                     )
-                stage4_metrics = getattr(train_module.model, "last_stage4_metrics", None)
+                stage4_metrics = getattr(metric_model, "last_stage4_metrics", None)
                 if stage4_metrics:
                     logs.update(
                         {
                             key: value.detach().item() if torch.is_tensor(value) else float(value)
                             for key, value in stage4_metrics.items()
+                        }
+                    )
+                goal_conditioned_metrics = getattr(
+                    metric_model, "last_goal_conditioned_metrics", None
+                )
+                if goal_conditioned_metrics:
+                    logs.update(
+                        {
+                            key: value.detach().item() if torch.is_tensor(value) else float(value)
+                            for key, value in goal_conditioned_metrics.items()
                         }
                     )
                 if loss_value is not None:

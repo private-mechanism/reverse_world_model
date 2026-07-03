@@ -1105,6 +1105,333 @@ RoboTwin success-rate module:
 - long-horizon multi-stage tasks。
 
 
+## 最终 Diffusion 方案: Goal-Conditioned Reverse Diffusion WVWAM
+
+### 方案概览
+
+该方案保留 diffusion 作为 video/action expert 的核心生成范式，不替换成 token-level AR decoder。完整闭环为：
+
+```text
+instruction + current observation/state
+  -> 从纯噪声多步采样 key video 与 key action chunk
+  -> detach predicted keys
+  -> 固定 predicted keys，多步采样 reverse video/action trajectory
+  -> reverse action 翻回正向顺序
+  -> receding-horizon 执行并重新规划
+```
+
+最终输出为：
+
+- key video: `x_hat_{t+H}`；
+- reverse key action chunk: `a_hat_{t+H-1}, ..., a_hat_{t+H-K}`；
+- reverse video: `x_hat_{t+H}, ..., x_hat_t`；
+- reverse action: `a_hat_{t+H-1}, ..., a_hat_t`。
+- executable forward action: `a_hat_t, ..., a_hat_{t+H-1}`。
+
+### 数据与训练目标
+
+当前配置使用 fixed-horizon，`action_chunk_size=32`，`key_action_chunk_size=4`。训练 batch 先采样：
+
+```text
+video_forward  = x_t, ..., x_{t+H}
+action_forward = a_t, ..., a_{t+H-1}
+```
+
+开启 `reverse_world_order=true` 后，训练视角变为：
+
+```text
+video_reverse  = x_{t+H}, ..., x_t
+action_reverse = a_{t+H-1}, ..., a_t
+```
+
+key target 来自 reverse 序列开头：
+
+```text
+key video target        = video_reverse[:, 0] = x_{t+H}
+key action chunk target = action_reverse[:, :K]
+```
+
+### Video Expert
+
+训练 key video 时，Video Expert 的条件为：
+
+```text instruction
++ current-frame latent z_t
++ noisy reverse-video latent
++ video diffusion timestep
+```
+
+GT key 不作为可见条件。原本指向 reverse 首帧的 condition anchor 被替换为 `z_t`，
+避免直接泄漏 `z_{t+H}`。Joint Key forward 只取一个 endpoint video latent，与长度为
+`K` 的 key-action chunk 联合去噪：
+
+```text
+L_key_video =
+  MSE(pred_key_video_velocity,
+      noise - video_reverse_latent[:, :, 0])
+```
+
+推理仍有 key/reverse 两个 video diffusion 阶段，但每个阶段都与对应 action diffusion
+放在同一个联合去噪循环中：
+
+```text
+joint key phase:
+  pure key-video noise + pure key-action noise
+  + instruction
+  + current-frame anchor z_t
+  -> N-step joint diffusion
+  -> pred_key_video + pred_key_action_chunk
+
+joint reverse phase:
+  new pure reverse-video noise + pure reverse-action noise
+  + instruction
+  + fixed pred_key_video anchor
+  + fixed pred_key_action prefix
+  -> N-step joint diffusion
+  -> after every scheduler step, clamp video position 0 and action positions [0:K]
+```
+
+当前完整实现针对 WoW-style condition channels；Wan2.2 需要单独设计不泄漏 GT 的 key condition，因此代码会显式拒绝该组合。
+
+### Action Expert
+
+Key-action chunk 的条件为：
+
+```text instruction
++ current multi-view image tokens
++ current robot state
++ noisy key-action chunk
++ action-dimension mask
++ action diffusion timestep
+```
+
+当前 `prediction_type=sample`，Action Expert 直接预测 clean action sample。虽然内部统一写成 flow target，代数上 loss 等价于：
+
+```text
+L_key_action =
+  masked MSE(pred_key_action_chunk, GT_key_action_chunk)
+```
+
+推理时 action 与 video 共用联合 model forward：
+
+```text
+joint key phase:
+  pure key-video noise + pure action noise [B, K, action_dim]
+  -> Action Expert 在每层读取 key-video KV
+  -> N-step joint diffusion
+  -> pred_key_action_chunk
+
+joint reverse phase:
+  pure reverse-video noise + new pure action noise [B, H, action_dim]
+  -> replace positions [0:K] with pred_key_action_chunk
+  -> Action Expert 按 causal frame mapping 读取 reverse-video KV
+  -> N-step joint diffusion
+  -> after every scheduler step, clamp positions [0:K]
+  -> pred_reverse_action
+```
+
+Action Expert 开启 causal self-attention，因此后面的 reverse-action token 可以关注 key prefix 和更靠近 horizon endpoint 的前序 token；但每个 diffusion step 仍然并行更新整个 chunk，不是 CoA 的逐 token AR。
+
+训练时 reverse-action loss 为：
+
+```text
+L_reverse_action =
+  masked MSE(pred_reverse_action, GT_reverse_action)
+```
+
+### Detach 与固定
+
+训练时：
+
+```text
+pred_key_video  = pred_key_video.detach()
+pred_key_action = pred_key_action.detach()
+```
+
+这会阻止 reverse loss 沿 predicted-key 张量回传到 key prediction；key predictor 由 key loss 监督，reverse generator 由 reverse loss 监督。
+
+训练 Reverse forward 时也会把 noisy video 的第 0 个位置和 noisy action 的 `[0:K]`
+替换为 detached clean keys，并从 reverse loss mask 中排除这些固定位置；它们分别由
+`L_key_video` 和 `L_key_action` 监督。这样训练输入结构与推理 clamp 保持一致。
+
+推理本身处于 `torch.no_grad()`，detach 不影响数值。所谓“固定”是指 reverse diffusion
+的每个 scheduler step 前后都重新写回同一个 clean key anchor/prefix，避免 scheduler
+改写 key。
+
+### Loss 与权重
+
+```text
+L_goal_conditioned =
+    lambda_key_video      * L_key_video
+  + lambda_key_action     * L_key_action
+  + lambda_reverse_video  * L_reverse_video
+  + lambda_reverse_action * L_reverse_action
+```
+
+当前四项权重均为 `1.0`。
+
+### 完整推理顺序
+
+```text
+1. 从 current observation/state 编码 language、image、state 和 current video latent。
+2. 从两组纯噪声联合多步采样 pred_key_video 与 pred_key_action_chunk。
+3. detach 并保存两个 predicted keys。
+4. 用固定 pred_key_video 和 pred_key_action prefix 联合多步采样 reverse video/action。
+5. 每个 scheduler step 同时更新两个模态并重新 clamp 两类 key。
+6. action_reverse 在时间维 flip，得到 forward executable action。
+7. RoboTwin 执行前若干动作，获取新 observation 后重新规划。
+```
+
+联合注意力采用有向分解：
+
+```text
+p(video, action | condition)
+= p(video | condition) * p(action | video, condition)
+```
+
+Video Expert 保持 pretrained video self-attention，不直接读取 action KV；Action Expert
+同时读取 video KV 与 action KV。因此不存在同一 reverse step 的双向循环依赖，但 action
+会显式依赖同一语义 key-video 和对应 reverse-video history。
+
+三个 causal 开关共同约束可见性：
+
+```yaml
+architecture:
+  model:
+    video_frame_causal_self_attn: true
+    action_video_frame_causal_kv: true
+    action_expert:
+      frame_causal_self_attn: true
+```
+
+对 reverse index `i`，video 只能读取 `video[0:i]`，action 只能读取
+`action[0:i]` 以及 frame mapping 后的 `video[0:phi(i)]`。因此联合生成没有破坏
+key-to-current 的逆序 causal 方向。
+
+### 工程开关
+
+```yaml
+training:
+  generation_mode: diffusion
+  reverse_world_order: true
+  goal_conditioned_wam: true
+  predict_key_video: true
+  predict_key_action: true
+  key_action_chunk_size: 4
+  use_predicted_key_condition: true
+  detach_predicted_key_condition: true
+  reverse_video_key_condition_type: latent_inpainting
+  reverse_action_key_condition_type: prefix
+  goal_conditioned_multistep_inference: true
+  goal_conditioned_return_forward_actions: true
+  goal_conditioned_video_guidance_scale: 5.0
+  goal_joint_key_diffusion: true
+  goal_joint_reverse_diffusion: true
+```
+
+主要代码路径：
+
+- `configs/model_config_loader.py`: 透传 goal-conditioned 相关配置；
+- `wam/runners/runner_world_casual_128dim.py`: joint-key/joint-reverse 训练 loss、多步联合 sampler、key clamp 和正序 action 输出；
+- `wam/samples/sample_world.py`: 使用 `pred_reverse_trajectory` 与逆序 GT 计算离线 action 指标；
+- `wam/deploy/robotwin_success_rate.py`: 使用 forward action 执行；完整模式下从在线当前相机构造 video latent；
+- `wam/trainers/train_world.py`: 记录 key/reverse video/action loss。
+
+回退方式：
+
+- `goal_joint_key_diffusion=false`：Key 阶段回到独立 video/action forward；
+- `goal_joint_reverse_diffusion=false`：Reverse 阶段回到独立 video/action forward；
+- `goal_conditioned_multistep_inference=false`：推理回到原有 sampler；
+- `goal_conditioned_wam=false`：训练和推理回到原始 reverse diffusion / stage2 / stage3 / stage4 路径。
+
+完整联合推理必须使用 `action_only=false`，以便在线 observation 经 VAE 构造 video
+latent。`action_only=true` 被保留为 action-only ablation，并会走独立 action sampler。
+
+### 验证方案
+
+训练：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 main_world.py \
+  --model_config_path=validation_tmp/goal_conditioned_joint_reverse_diffusion.yml
+```
+
+该联合版本使用独立输出目录：
+
+```text
+checkpoints/validation-goal-conditioned-joint-reverse-diffusion
+```
+
+TensorBoard 对比标签：
+
+```text
+Goal_Joint
+Goal_Independent
+Original_WVWAM
+```
+
+需要重点观察：
+
+- `loss_gc_key_video` 是否下降；
+- `loss_gc_key_action` 是否下降；
+- `loss_gc_reverse_video` 是否不因 predicted key condition 明显发散；
+- `loss_gc_reverse_action` 是否稳定；
+- `pred_key_action.shape == [B, 4, 128]`；
+- `pred_reverse_trajectory.shape == [B, 32, 128]`；
+- `pred_trajectory == flip(pred_reverse_trajectory, dim=time)`；
+- reverse-video 第 0 个 latent 与 `pred_key_video` 一致；
+- 观察 `overall_avg_sample_key_action_mse/l1` 与 `overall_avg_sample_key_video_latent_l1`；
+- forward-view video 可视化是否比普通 reverse diffusion 更接近 goal-conditioned 预期；
+- RoboTwin 不应对已经标记为 `trajectory_order=forward` 的 action 再次 flip；
+- 比较 action-only 在线成功率与完整 video/action 在线成功率。
+
+### Original WVWAM 对照实验
+
+对照配置：
+
+```text
+validation_tmp/original_wvwam_baseline.yml
+```
+
+控制变量保持一致：
+
+```text
+dataset / fixed horizon / action_chunk_size=32
+batch size / gradient accumulation
+video resolution / three-camera input
+optimizer / learning rate / scheduler
+1000 training steps / sample periods
+diffusion scheduler / 5 inference steps
+```
+
+仅关闭 Goal-Conditioned Reverse 所需设置：
+
+```yaml
+training:
+  reverse_world_order: false
+  goal_conditioned_wam: false
+  predict_key_video: false
+  predict_key_action: false
+  use_predicted_key_condition: false
+  goal_conditioned_multistep_inference: false
+
+architecture:
+  model:
+    action_expert:
+      frame_causal_self_attn: false
+    video_frame_causal_self_attn: false
+```
+
+TensorBoard 使用相同入口并区分为：
+
+```text
+Goal_Conditioned
+Original_WVWAM
+```
+
+重点比较共同指标 `loss_a`, `loss_v`, action MSE/L1、video latent L1、PSNR 和 SSIM。Goal-Conditioned 独有的 key loss/metric 用于内部诊断，不与 baseline 做一一对应。
+
+
 ## 推荐实现顺序
 
 1. 阶段 1: oracle reverse WVWAM。

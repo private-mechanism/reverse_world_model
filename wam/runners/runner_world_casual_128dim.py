@@ -208,6 +208,48 @@ class FMPRunner(nn.Module,
         self.stage4_action_latent_loss_weight = float(config.get("stage4_action_latent_loss_weight", 0.1))
         self.stage4_action_latent_detach_target = bool(config.get("stage4_action_latent_detach_target", True))
         self.last_stage4_metrics = {}
+        self.goal_conditioned_wam = bool(config.get("goal_conditioned_wam", False))
+        self.predict_key_video = bool(config.get("predict_key_video", True))
+        self.predict_key_action = bool(config.get("predict_key_action", True))
+        self.key_action_chunk_size = int(config.get("key_action_chunk_size", 4))
+        self.use_predicted_key_condition = bool(config.get("use_predicted_key_condition", True))
+        self.detach_predicted_key_condition = bool(config.get("detach_predicted_key_condition", True))
+        self.reverse_video_key_condition_type = str(
+            config.get("reverse_video_key_condition_type", "latent_inpainting")
+        ).strip().lower()
+        self.reverse_action_key_condition_type = str(
+            config.get("reverse_action_key_condition_type", "prefix")
+        ).strip().lower()
+        self.key_video_loss_weight = float(config.get("key_video_loss_weight", 1.0))
+        self.key_action_loss_weight = float(config.get("key_action_loss_weight", 1.0))
+        self.reverse_video_loss_weight = float(config.get("reverse_video_loss_weight", 1.0))
+        self.reverse_action_loss_weight = float(config.get("reverse_action_loss_weight", 1.0))
+        self.reverse_world_order = bool(config.get("reverse_world_order", False))
+        self.goal_conditioned_multistep_inference = bool(
+            config.get("goal_conditioned_multistep_inference", False)
+        )
+        self.goal_conditioned_return_forward_actions = bool(
+            config.get("goal_conditioned_return_forward_actions", True)
+        )
+        self.goal_conditioned_video_guidance_scale = float(
+            config.get("goal_conditioned_video_guidance_scale", 5.0)
+        )
+        self.goal_joint_key_diffusion = bool(
+            config.get("goal_joint_key_diffusion", False)
+        )
+        self.goal_joint_reverse_diffusion = bool(
+            config.get("goal_joint_reverse_diffusion", False)
+        )
+        if (
+            self.goal_conditioned_wam
+            and self.goal_joint_key_diffusion
+            and (not self.predict_key_video or not self.predict_key_action)
+        ):
+            raise ValueError(
+                "goal_joint_key_diffusion=true requires both "
+                "predict_key_video=true and predict_key_action=true."
+            )
+        self.last_goal_conditioned_metrics = {}
         lang_token_dim = int(config.get("lang_token_dim", config.action_expert.get("text_dim", 4096)))
         self.stage4_video_lang_proj = nn.Linear(lang_token_dim, self._noise_video_channels)
         self.stage4_video_state_proj = nn.Linear(self.state_token_dim, self._noise_video_channels)
@@ -245,6 +287,514 @@ class FMPRunner(nn.Module,
             wan22=True,
             latent_spatial_shape=latent_spatial,
         )
+
+    def _goal_action_scheduler_step(
+        self,
+        *,
+        model_pred: torch.Tensor,
+        initial_noise: torch.Tensor,
+        timestep,
+        sample: torch.Tensor,
+    ) -> torch.Tensor:
+        """Advance one action diffusion step using the configured prediction parameterization."""
+        if self.noise_scheduler_type == "ddpm":
+            return self.noise_scheduler_sample_action.step(
+                model_pred, timestep, sample
+            ).prev_sample
+        if self.prediction_type == "sample":
+            scheduler_output = initial_noise - model_pred
+        elif self.prediction_type == "noise":
+            scheduler_output = sample - model_pred
+        else:
+            scheduler_output = model_pred
+        return self.noise_scheduler_sample_action.step(
+            scheduler_output, timestep, sample
+        )
+
+    @torch.no_grad()
+    def _sample_goal_joint_video_action(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        img_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        action_mask: torch.Tensor,
+        video_template: torch.Tensor,
+        condition_video_latents: torch.Tensor,
+        anchor_video_latent: torch.Tensor,
+        action_horizon: int,
+        seed: Optional[int],
+        num_inference_timesteps: Optional[int],
+        clamp_video_anchor: bool,
+        fixed_action_prefix: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Jointly denoise video/action so action queries can attend causal video KV."""
+        if self._video_expert_is_wan22:
+            raise NotImplementedError(
+                "Goal-conditioned joint video/action sampling currently requires "
+                "WoW-style condition channels."
+            )
+        if condition_video_latents is None:
+            raise ValueError(
+                "condition_video_latents is required for joint goal-conditioned sampling."
+            )
+
+        device = video_template.device
+        video_dtype = video_template.dtype
+        action_dtype = state_tokens.dtype
+        batch_size, _channels, frames, height, width = video_template.shape
+        base_seed = 42 if seed is None else int(seed)
+        video_generator = torch.Generator(device=device)
+        video_generator.manual_seed(base_seed)
+        action_generator = torch.Generator(device=device)
+        action_generator.manual_seed(base_seed + 1)
+
+        noisy_video = torch.randn(
+            batch_size,
+            self._noise_video_channels,
+            frames,
+            height,
+            width,
+            device=device,
+            dtype=video_dtype,
+            generator=video_generator,
+        )
+        noisy_action = torch.randn(
+            batch_size,
+            action_horizon,
+            self.state_token_dim,
+            device=device,
+            dtype=action_dtype,
+            generator=action_generator,
+        )
+        initial_action_noise = noisy_action.clone()
+        anchor = anchor_video_latent.detach().to(device=device, dtype=video_dtype)
+        condition = self._video_condition_with_anchor(
+            condition_video_latents, anchor
+        )
+        action_prefix = (
+            fixed_action_prefix.detach().to(device=device, dtype=action_dtype)
+            if fixed_action_prefix is not None
+            else None
+        )
+        prefix_len = (
+            min(action_prefix.shape[1], action_horizon)
+            if action_prefix is not None
+            else 0
+        )
+        action_mask_expanded = action_mask.to(
+            device=device, dtype=action_dtype
+        ).expand(-1, action_horizon, -1)
+
+        num_steps = (
+            int(num_inference_timesteps)
+            if num_inference_timesteps is not None
+            else self.num_inference_timesteps
+        )
+        timesteps_action = self.noise_scheduler_sample_action.set_timesteps(num_steps)
+        self.noise_scheduler_sample_video.set_timesteps(num_steps, device=device)
+        timesteps_video = self.noise_scheduler_sample_video.timesteps
+        if len(timesteps_action) != len(timesteps_video):
+            raise RuntimeError(
+                "Joint goal-conditioned sampling requires action/video schedulers "
+                "to expose the same number of inference timesteps."
+            )
+
+        guidance_scale = self.goal_conditioned_video_guidance_scale
+        for timestep_action_scalar, timestep_video_scalar in zip(
+            timesteps_action, timesteps_video
+        ):
+            if clamp_video_anchor:
+                noisy_video[:, :, :1] = anchor[:, :, :1]
+            if prefix_len:
+                noisy_action[:, :prefix_len] = action_prefix[:, :prefix_len]
+
+            hidden_states_video = torch.cat(
+                [noisy_video, condition], dim=1
+            ).to(self.dtype)
+            timestep_action = (
+                torch.ones(batch_size, device=device) * timestep_action_scalar
+            ).long()
+            timestep_video = self._timestep_video_tensor(
+                timestep_video_scalar, batch_size, device, noisy_video
+            )
+            pred_video, pred_action = self.model(
+                hidden_states_video=hidden_states_video,
+                hidden_states_action=torch.cat(
+                    [noisy_action, action_mask_expanded], dim=2
+                ).to(self.dtype),
+                hidden_states_robostate=torch.cat(
+                    [state_tokens, action_mask], dim=2
+                ).to(self.dtype),
+                hidden_states_visual=img_tokens.to(self.dtype),
+                timestep_action=timestep_action,
+                timestep_video=timestep_video,
+                encoder_hidden_states=lang_tokens.to(self.dtype),
+                value=None,
+                video_kv_mask_mode="off",
+                return_dict=False,
+            )
+            if guidance_scale > 1.0:
+                uncond_video, _uncond_action = self.model(
+                    hidden_states_video=hidden_states_video,
+                    hidden_states_action=torch.cat(
+                        [noisy_action, action_mask_expanded], dim=2
+                    ).to(self.dtype),
+                    hidden_states_robostate=torch.cat(
+                        [state_tokens, action_mask], dim=2
+                    ).to(self.dtype),
+                    hidden_states_visual=img_tokens.to(self.dtype),
+                    timestep_action=timestep_action,
+                    timestep_video=timestep_video,
+                    encoder_hidden_states=torch.zeros_like(lang_tokens).to(self.dtype),
+                    value=None,
+                    video_kv_mask_mode="off",
+                    return_dict=False,
+                )
+                pred_video = uncond_video + guidance_scale * (
+                    pred_video - uncond_video
+                )
+
+            noisy_video = self.noise_scheduler_sample_video.step(
+                pred_video,
+                timestep_video_scalar,
+                noisy_video,
+                return_dict=False,
+            )[0].to(video_dtype)
+            noisy_action = self._goal_action_scheduler_step(
+                model_pred=pred_action[:, :action_horizon].to(action_dtype),
+                initial_noise=initial_action_noise,
+                timestep=timestep_action_scalar,
+                sample=noisy_action,
+            ).to(action_dtype)
+            if clamp_video_anchor:
+                noisy_video[:, :, :1] = anchor[:, :, :1]
+            if prefix_len:
+                noisy_action[:, :prefix_len] = action_prefix[:, :prefix_len]
+
+        return noisy_video, noisy_action.mul(action_mask_expanded)
+
+    @torch.no_grad()
+    def _sample_goal_action_chunk(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        img_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        action_mask: torch.Tensor,
+        horizon: int,
+        seed: Optional[int],
+        num_inference_timesteps: Optional[int],
+        fixed_prefix: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Sample an action chunk from pure noise, optionally clamping a clean prefix."""
+        device = lang_tokens.device
+        dtype = state_tokens.dtype
+        batch_size = state_tokens.shape[0]
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+        noisy_action = torch.randn(
+            batch_size,
+            horizon,
+            self.state_token_dim,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+        initial_noise = noisy_action.clone()
+        prefix = fixed_prefix.detach().to(device=device, dtype=dtype) if fixed_prefix is not None else None
+        prefix_len = min(prefix.shape[1], horizon) if prefix is not None else 0
+        action_mask_expanded = action_mask.to(device=device, dtype=dtype).expand(-1, horizon, -1)
+        num_steps = (
+            int(num_inference_timesteps)
+            if num_inference_timesteps is not None
+            else self.num_inference_timesteps
+        )
+        timesteps = self.noise_scheduler_sample_action.set_timesteps(num_steps)
+
+        for timestep in timesteps:
+            if prefix_len:
+                noisy_action[:, :prefix_len] = prefix[:, :prefix_len]
+            timestep_action = (
+                torch.ones(batch_size, device=device) * timestep
+            ).long()
+            _pred_video, pred_action = self.model(
+                hidden_states_video=None,
+                hidden_states_action=torch.cat(
+                    [noisy_action, action_mask_expanded], dim=2
+                ).to(self.dtype),
+                hidden_states_robostate=torch.cat(
+                    [state_tokens, action_mask], dim=2
+                ).to(self.dtype),
+                hidden_states_visual=img_tokens.to(self.dtype),
+                timestep_action=timestep_action,
+                timestep_video=None,
+                encoder_hidden_states=lang_tokens.to(self.dtype),
+                value=None,
+                video_kv_mask_mode="off",
+                return_dict=False,
+            )
+            del _pred_video
+            noisy_action = self._goal_action_scheduler_step(
+                model_pred=pred_action[:, :horizon].to(dtype),
+                initial_noise=initial_noise,
+                timestep=timestep,
+                sample=noisy_action,
+            ).to(dtype)
+            if prefix_len:
+                noisy_action[:, :prefix_len] = prefix[:, :prefix_len]
+
+        return noisy_action.mul(action_mask_expanded)
+
+    @torch.no_grad()
+    def _sample_goal_video(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        video_latents: torch.Tensor,
+        condition_video_latents: torch.Tensor,
+        anchor_video_latent: torch.Tensor,
+        seed: int,
+        num_inference_timesteps: Optional[int],
+        clamp_anchor: bool,
+    ) -> torch.Tensor:
+        """Sample a video from pure noise with a current-frame or predicted-key anchor."""
+        if self._video_expert_is_wan22:
+            raise NotImplementedError(
+                "Goal-conditioned key-video sampling currently requires WoW-style "
+                "condition channels; Wan2.2 needs a separate non-leaking key condition."
+            )
+        if condition_video_latents is None:
+            raise ValueError("condition_video_latents is required for goal-conditioned video sampling.")
+
+        device = video_latents.device
+        dtype = video_latents.dtype
+        batch_size, _channels, frames, height, width = video_latents.shape
+        anchor = anchor_video_latent.detach().to(device=device, dtype=dtype)
+        condition = self._video_condition_with_anchor(
+            condition_video_latents, anchor
+        )
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+        noisy_video = torch.randn(
+            batch_size,
+            self._noise_video_channels,
+            frames,
+            height,
+            width,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+        num_steps = (
+            int(num_inference_timesteps)
+            if num_inference_timesteps is not None
+            else self.num_inference_timesteps
+        )
+        self.noise_scheduler_sample_video.set_timesteps(num_steps, device=device)
+        timesteps = self.noise_scheduler_sample_video.timesteps
+        guidance_scale = self.goal_conditioned_video_guidance_scale
+
+        for timestep in timesteps:
+            if clamp_anchor:
+                noisy_video[:, :, :1] = anchor[:, :, :1]
+            hidden_states_video = torch.cat(
+                [noisy_video, condition], dim=1
+            ).to(self.dtype)
+            timestep_video = self._timestep_video_tensor(
+                timestep, batch_size, device, noisy_video
+            )
+            pred_video, _pred_action = self.model(
+                hidden_states_video=hidden_states_video,
+                hidden_states_action=None,
+                hidden_states_robostate=None,
+                hidden_states_visual=None,
+                timestep_action=None,
+                timestep_video=timestep_video,
+                encoder_hidden_states=lang_tokens.to(self.dtype),
+                value=None,
+                video_kv_mask_mode="off",
+                return_dict=False,
+            )
+            del _pred_action
+            if guidance_scale > 1.0:
+                uncond_video, _uncond_action = self.model(
+                    hidden_states_video=hidden_states_video,
+                    hidden_states_action=None,
+                    hidden_states_robostate=None,
+                    hidden_states_visual=None,
+                    timestep_action=None,
+                    timestep_video=timestep_video,
+                    encoder_hidden_states=torch.zeros_like(lang_tokens).to(self.dtype),
+                    value=None,
+                    video_kv_mask_mode="off",
+                    return_dict=False,
+                )
+                del _uncond_action
+                pred_video = uncond_video + guidance_scale * (
+                    pred_video - uncond_video
+                )
+            noisy_video = self.noise_scheduler_sample_video.step(
+                pred_video, timestep, noisy_video, return_dict=False
+            )[0].to(dtype)
+            if clamp_anchor:
+                noisy_video[:, :, :1] = anchor[:, :, :1]
+
+        return noisy_video
+
+    @torch.no_grad()
+    def conditional_sample_goal_conditioned_reverse_diffusion(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        lang_attn_mask: torch.Tensor,
+        img_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        action_mask: torch.Tensor,
+        ctrl_freqs: torch.Tensor,
+        video_latents: Optional[torch.Tensor],
+        condition_video_latents: Optional[torch.Tensor],
+        video_only: bool,
+        action_only: bool,
+        seed: Optional[int],
+        num_inference_timesteps: Optional[int],
+    ):
+        """Two-stage inference: sample keys first, then reverse trajectories."""
+        del lang_attn_mask, ctrl_freqs
+        if not self.reverse_world_order:
+            raise ValueError(
+                "Goal-conditioned reverse diffusion inference requires reverse_world_order=true."
+            )
+
+        sample_video = not action_only
+        sample_action = not video_only
+        pred_key_video = None
+        pred_reverse_video = None
+        pred_key_action = None
+        pred_reverse_action = None
+        base_seed = 42 if seed is None else int(seed)
+
+        if sample_video:
+            if not self.predict_key_video:
+                raise ValueError("predict_key_video must be enabled for multi-step key-video inference.")
+            if video_latents is None or condition_video_latents is None:
+                raise ValueError(
+                    "video_latents and condition_video_latents are required when video sampling is enabled."
+                )
+        if sample_action and not self.predict_key_action:
+            raise ValueError(
+                "predict_key_action must be enabled for multi-step key-action inference."
+            )
+
+        use_joint_key = (
+            self.goal_joint_key_diffusion and sample_video and sample_action
+        )
+        use_joint_reverse = (
+            self.goal_joint_reverse_diffusion and sample_video and sample_action
+        )
+        key_len = max(1, min(self.key_action_chunk_size, self.pred_horizon))
+
+        if use_joint_key:
+            current_video_anchor = video_latents[:, :, -1:].detach()
+            key_video_candidate, key_action_candidate = (
+                self._sample_goal_joint_video_action(
+                    lang_tokens=lang_tokens,
+                    img_tokens=img_tokens,
+                    state_tokens=state_tokens,
+                    action_mask=action_mask,
+                    video_template=video_latents[:, :, :1],
+                    condition_video_latents=condition_video_latents[:, :, :1],
+                    anchor_video_latent=current_video_anchor,
+                    action_horizon=key_len,
+                    seed=base_seed,
+                    num_inference_timesteps=num_inference_timesteps,
+                    clamp_video_anchor=False,
+                )
+            )
+            pred_key_video = key_video_candidate[:, :, :1].detach()
+            pred_key_action = key_action_candidate[:, :key_len].detach()
+        else:
+            if sample_video:
+                current_video_anchor = video_latents[:, :, -1:].detach()
+                key_video_candidate = self._sample_goal_video(
+                    lang_tokens=lang_tokens,
+                    video_latents=video_latents,
+                    condition_video_latents=condition_video_latents,
+                    anchor_video_latent=current_video_anchor,
+                    seed=base_seed,
+                    num_inference_timesteps=num_inference_timesteps,
+                    clamp_anchor=False,
+                )
+                pred_key_video = key_video_candidate[:, :, :1].detach()
+            if sample_action:
+                pred_key_action = self._sample_goal_action_chunk(
+                    lang_tokens=lang_tokens,
+                    img_tokens=img_tokens,
+                    state_tokens=state_tokens,
+                    action_mask=action_mask,
+                    horizon=key_len,
+                    seed=base_seed + 1,
+                    num_inference_timesteps=num_inference_timesteps,
+                ).detach()
+
+        if use_joint_reverse:
+            pred_reverse_video, pred_reverse_action = (
+                self._sample_goal_joint_video_action(
+                    lang_tokens=lang_tokens,
+                    img_tokens=img_tokens,
+                    state_tokens=state_tokens,
+                    action_mask=action_mask,
+                    video_template=video_latents,
+                    condition_video_latents=condition_video_latents,
+                    anchor_video_latent=pred_key_video,
+                    action_horizon=self.pred_horizon,
+                    seed=base_seed + 2,
+                    num_inference_timesteps=num_inference_timesteps,
+                    clamp_video_anchor=True,
+                    fixed_action_prefix=pred_key_action,
+                )
+            )
+        else:
+            if sample_video:
+                pred_reverse_video = self._sample_goal_video(
+                    lang_tokens=lang_tokens,
+                    video_latents=video_latents,
+                    condition_video_latents=condition_video_latents,
+                    anchor_video_latent=pred_key_video,
+                    seed=base_seed + 2,
+                    num_inference_timesteps=num_inference_timesteps,
+                    clamp_anchor=True,
+                )
+            if sample_action:
+                pred_reverse_action = self._sample_goal_action_chunk(
+                    lang_tokens=lang_tokens,
+                    img_tokens=img_tokens,
+                    state_tokens=state_tokens,
+                    action_mask=action_mask,
+                    horizon=self.pred_horizon,
+                    seed=base_seed + 3,
+                    num_inference_timesteps=num_inference_timesteps,
+                    fixed_prefix=pred_key_action,
+                )
+
+        if pred_reverse_action is not None and self.goal_conditioned_return_forward_actions:
+            pred_trajectory = torch.flip(pred_reverse_action, dims=[1])
+            trajectory_order = "forward"
+        else:
+            pred_trajectory = pred_reverse_action
+            trajectory_order = "reverse"
+
+        return {
+            "pred_trajectory": pred_trajectory,
+            "pred_reverse_trajectory": pred_reverse_action,
+            "pred_video": pred_reverse_video,
+            "pred_key_video": pred_key_video,
+            "pred_key_action": pred_key_action,
+            "pred_value": None,
+            "trajectory_order": trajectory_order,
+        }
 
     def conditional_sample(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens, action_mask,
                             ctrl_freqs, video_latents, condition_video_latents,
@@ -1032,6 +1582,648 @@ class FMPRunner(nn.Module,
             loss_value = None
         return loss_action, loss_value
 
+    def _video_condition_with_anchor(
+        self,
+        condition_video_latents: torch.Tensor,
+        anchor_video_latent: torch.Tensor,
+    ) -> torch.Tensor:
+        """Use ``anchor_video_latent`` as the visible frame in WoW-style video condition channels."""
+        if condition_video_latents is None or self._video_expert_is_wan22:
+            return condition_video_latents
+        cond = condition_video_latents.clone()
+        cond_channels = cond.shape[1]
+        content_channels = min(self._noise_video_channels, anchor_video_latent.shape[1])
+        mask_channels = cond_channels - content_channels
+        if mask_channels <= 0:
+            cond[:, :content_channels, :1] = anchor_video_latent[:, :content_channels, :1]
+            return cond
+        cond[:, :mask_channels] = 0
+        cond[:, :mask_channels, :1] = 1
+        cond[:, mask_channels : mask_channels + content_channels] = 0
+        cond[:, mask_channels : mask_channels + content_channels, :1] = anchor_video_latent[
+            :, :content_channels, :1
+        ]
+        return cond
+
+    def _clean_action_from_diffusion_pred(
+        self,
+        *,
+        pred_action: torch.Tensor,
+        noise_for_action: torch.Tensor,
+        noisy_action: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.prediction_type in ("velocity", "v_prediction"):
+            return noise_for_action - pred_action
+        if self.prediction_type == "sample":
+            return pred_action
+        if self.prediction_type == "noise":
+            return noisy_action - pred_action
+        return noise_for_action - pred_action
+
+    def _compute_goal_joint_key_diffusion_loss(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        img_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        action_gt: torch.Tensor,
+        action_mask: torch.Tensor,
+        action_valid_mask: Optional[torch.Tensor],
+        video_latents: torch.Tensor,
+        condition_video_latents: torch.Tensor,
+        video_kv_mask_mode: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict horizon key-video and key-action in one coupled diffusion forward."""
+        if self._video_expert_is_wan22:
+            raise NotImplementedError(
+                "Joint key diffusion currently requires WoW-style video conditions."
+            )
+
+        batch_size = lang_tokens.shape[0]
+        device = lang_tokens.device
+        key_len = max(1, min(self.key_action_chunk_size, action_gt.shape[1]))
+        key_action_gt = action_gt[:, :key_len]
+        key_valid_mask = (
+            action_valid_mask[:, :key_len]
+            if action_valid_mask is not None
+            else None
+        )
+        key_video_gt = video_latents[:, :, :1]
+        current_anchor = video_latents[:, :, -1:]
+        current_condition = self._video_condition_with_anchor(
+            condition_video_latents[:, :, :1], current_anchor
+        )
+
+        (
+            noise_for_video,
+            noisy_video_hidden,
+            timesteps_for_video,
+            per_element_loss_mask,
+        ) = _video_train_diffusion_prep(
+            self.noise_scheduler_video,
+            key_video_gt,
+            current_condition,
+            self.dtype,
+            wan22=False,
+        )
+        noise_for_action = torch.randn(
+            key_action_gt.shape,
+            dtype=key_action_gt.dtype,
+            device=device,
+        )
+        _sigmas_action, timesteps_for_action = self.noise_scheduler_action.sample(
+            batch_size, device=device
+        )
+        noisy_action = self.noise_scheduler_action.add_noise(
+            key_action_gt, noise_for_action, timesteps_for_action
+        )
+        action_mask_expanded = action_mask.expand(-1, key_len, -1)
+
+        pred_video, pred_action = self.model(
+            hidden_states_video=noisy_video_hidden.to(self.dtype),
+            hidden_states_action=torch.cat(
+                [noisy_action, action_mask_expanded], dim=2
+            ).to(self.dtype),
+            hidden_states_robostate=torch.cat(
+                [state_tokens, action_mask], dim=2
+            ).to(self.dtype),
+            hidden_states_visual=img_tokens.to(self.dtype),
+            timestep_action=timesteps_for_action,
+            timestep_video=timesteps_for_video,
+            encoder_hidden_states=lang_tokens.to(self.dtype),
+            value=None,
+            video_kv_mask_mode=video_kv_mask_mode,
+            return_dict=False,
+        )
+        pred_action = pred_action[:, :key_len]
+
+        target_video = (noise_for_video - key_video_gt).to(self.dtype)
+        video_loss_elem = F.mse_loss(
+            pred_video, target_video, reduction="none"
+        )
+        if per_element_loss_mask is None:
+            loss_key_video = video_loss_elem.mean()
+        else:
+            loss_key_video = (
+                video_loss_elem * per_element_loss_mask
+            ).sum() / per_element_loss_mask.sum().clamp_min(1.0)
+
+        target_action = (noise_for_action - key_action_gt).to(self.dtype)
+        if self.prediction_type == "velocity":
+            action_loss_pred = pred_action.to(self.dtype)
+        elif self.prediction_type == "sample":
+            action_loss_pred = (noise_for_action - pred_action).to(self.dtype)
+        elif self.prediction_type == "noise":
+            action_loss_pred = (pred_action - key_action_gt).to(self.dtype)
+        else:
+            action_loss_pred = pred_action.to(self.dtype)
+        loss_key_action = self._masked_mse(
+            action_loss_pred, target_action, key_valid_mask
+        )
+
+        pred_key_video = (
+            noise_for_video - pred_video.to(noise_for_video.dtype)
+        )
+        pred_key_action = self._clean_action_from_diffusion_pred(
+            pred_action=pred_action.to(key_action_gt.dtype),
+            noise_for_action=noise_for_action,
+            noisy_action=noisy_action,
+        )
+        return (
+            loss_key_video,
+            loss_key_action,
+            pred_key_video.to(video_latents.dtype),
+            pred_key_action,
+        )
+
+    def _compute_goal_joint_reverse_diffusion_loss(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        img_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        action_gt: torch.Tensor,
+        action_mask: torch.Tensor,
+        value: Optional[torch.Tensor],
+        action_valid_mask: Optional[torch.Tensor],
+        video_latents: torch.Tensor,
+        condition_video_latents: torch.Tensor,
+        pred_key_video: Optional[torch.Tensor],
+        pred_key_action: Optional[torch.Tensor],
+        video_kv_mask_mode: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Denoise complete reverse video/action trajectories in one model forward."""
+        batch_size = lang_tokens.shape[0]
+        device = lang_tokens.device
+        reverse_condition = condition_video_latents
+        if (
+            pred_key_video is not None
+            and self.use_predicted_key_condition
+            and self.reverse_video_key_condition_type
+            in ("latent_inpainting", "first_frame", "anchor")
+        ):
+            reverse_condition = self._video_condition_with_anchor(
+                condition_video_latents, pred_key_video
+            )
+
+        (
+            noise_for_video,
+            noisy_video_hidden,
+            timesteps_for_video,
+            per_element_loss_mask,
+        ) = _video_train_diffusion_prep(
+            self.noise_scheduler_video,
+            video_latents,
+            reverse_condition,
+            self.dtype,
+            wan22=self._video_expert_is_wan22,
+        )
+        fixed_video_key = (
+            pred_key_video is not None
+            and self.use_predicted_key_condition
+            and self.reverse_video_key_condition_type
+            in ("latent_inpainting", "first_frame", "anchor")
+        )
+        if fixed_video_key and not self._video_expert_is_wan22:
+            noisy_video_hidden = noisy_video_hidden.clone()
+            noisy_video_hidden[
+                :, : self._noise_video_channels, :1
+            ] = pred_key_video[:, : self._noise_video_channels, :1].to(
+                noisy_video_hidden.dtype
+            )
+        noise_for_action = torch.randn(
+            action_gt.shape, dtype=action_gt.dtype, device=device
+        )
+        noise_for_value = (
+            torch.randn(value.shape, dtype=value.dtype, device=device)
+            if self.use_value
+            else None
+        )
+        _sigmas_action, timesteps_for_action = self.noise_scheduler_action.sample(
+            batch_size, device=device
+        )
+        noisy_action = self.noise_scheduler_action.add_noise(
+            action_gt, noise_for_action, timesteps_for_action
+        )
+        fixed_action_key_len = 0
+        if (
+            pred_key_action is not None
+            and self.use_predicted_key_condition
+            and self.reverse_action_key_condition_type
+            in ("prefix", "replace_first")
+        ):
+            fixed_action_key_len = min(
+                pred_key_action.shape[1], noisy_action.shape[1]
+            )
+            noisy_action = noisy_action.clone()
+            noisy_action[:, :fixed_action_key_len] = pred_key_action[
+                :, :fixed_action_key_len
+            ].to(noisy_action.dtype)
+        noisy_value = (
+            self.noise_scheduler_action.add_noise(
+                value, noise_for_value, timesteps_for_action
+            )
+            if self.use_value
+            else None
+        )
+        action_mask_expanded = action_mask.expand(-1, noisy_action.shape[1], -1)
+
+        pred_video, pred_action = self.model(
+            hidden_states_video=noisy_video_hidden.to(self.dtype),
+            hidden_states_action=torch.cat(
+                [noisy_action, action_mask_expanded], dim=2
+            ).to(self.dtype),
+            hidden_states_robostate=torch.cat(
+                [state_tokens, action_mask], dim=2
+            ).to(self.dtype),
+            hidden_states_visual=img_tokens.to(self.dtype),
+            timestep_action=timesteps_for_action,
+            timestep_video=timesteps_for_video,
+            encoder_hidden_states=lang_tokens.to(self.dtype),
+            value=(
+                torch.cat([noisy_value, action_mask], dim=2).to(self.dtype)
+                if self.use_value
+                else None
+            ),
+            video_kv_mask_mode=video_kv_mask_mode,
+            return_dict=False,
+        )
+
+        if self.use_value and value is not None:
+            pred_value = pred_action[:, -1:]
+            pred_action = pred_action[:, :-1]
+            target_value = (noise_for_value - value).to(self.dtype)
+        else:
+            pred_value = None
+            target_value = None
+
+        target_action = (noise_for_action - action_gt).to(self.dtype)
+        if self.prediction_type == "velocity":
+            action_loss_pred = pred_action.to(self.dtype)
+            value_loss_pred = (
+                pred_value.detach().to(self.dtype)
+                if pred_value is not None
+                else None
+            )
+        elif self.prediction_type == "sample":
+            action_loss_pred = (noise_for_action - pred_action).to(self.dtype)
+            value_loss_pred = (
+                (noise_for_value.detach() - pred_value.detach()).to(self.dtype)
+                if pred_value is not None
+                else None
+            )
+        elif self.prediction_type == "noise":
+            action_loss_pred = (pred_action - action_gt).to(self.dtype)
+            value_loss_pred = (
+                (pred_value.detach() - value).to(self.dtype)
+                if pred_value is not None
+                else None
+            )
+        else:
+            action_loss_pred = pred_action.to(self.dtype)
+            value_loss_pred = (
+                pred_value.detach().to(self.dtype)
+                if pred_value is not None
+                else None
+            )
+        reverse_action_valid_mask = action_valid_mask
+        if fixed_action_key_len:
+            if reverse_action_valid_mask is None:
+                reverse_action_valid_mask = action_gt.new_ones(
+                    action_gt.shape[0], action_gt.shape[1]
+                )
+            else:
+                reverse_action_valid_mask = reverse_action_valid_mask.clone()
+            reverse_action_valid_mask[:, :fixed_action_key_len] = 0
+        loss_reverse_action = self._masked_mse(
+            action_loss_pred, target_action, reverse_action_valid_mask
+        )
+        loss_value = (
+            F.mse_loss(value_loss_pred, target_value.detach())
+            if value_loss_pred is not None and target_value is not None
+            else None
+        )
+
+        target_video = (noise_for_video - video_latents).to(self.dtype)
+        video_loss_elem = F.mse_loss(
+            pred_video, target_video, reduction="none"
+        )
+        if fixed_video_key:
+            if per_element_loss_mask is None:
+                per_element_loss_mask = torch.ones_like(
+                    video_loss_elem, dtype=self.dtype
+                )
+            else:
+                per_element_loss_mask = per_element_loss_mask.clone()
+            per_element_loss_mask[:, :, :1] = 0
+        if per_element_loss_mask is None:
+            loss_reverse_video = video_loss_elem.mean()
+        else:
+            loss_reverse_video = (
+                video_loss_elem * per_element_loss_mask
+            ).sum() / per_element_loss_mask.sum().clamp_min(1.0)
+        return loss_reverse_action, loss_reverse_video, loss_value
+
+    def _compute_goal_key_action_diffusion_loss(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        img_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        action_gt: torch.Tensor,
+        action_mask: torch.Tensor,
+        action_valid_mask: Optional[torch.Tensor],
+        video_kv_mask_mode: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        key_len = max(1, min(self.key_action_chunk_size, action_gt.shape[1]))
+        key_action_gt = action_gt[:, :key_len]
+        key_valid_mask = action_valid_mask[:, :key_len] if action_valid_mask is not None else None
+        batch_size = lang_tokens.shape[0]
+        device = lang_tokens.device
+        noise_for_action = torch.randn(key_action_gt.shape, dtype=key_action_gt.dtype, device=device)
+        _sigmas, timesteps = self.noise_scheduler_action.sample(batch_size, device=device)
+        noisy_action = self.noise_scheduler_action.add_noise(key_action_gt, noise_for_action, timesteps)
+        action_mask_expanded = action_mask.expand(-1, key_len, -1)
+        _pred_video_unused, pred_action = self.model(
+            hidden_states_video=None,
+            hidden_states_action=torch.cat([noisy_action, action_mask_expanded], dim=2).to(self.dtype),
+            hidden_states_robostate=torch.cat([state_tokens, action_mask], dim=2).to(self.dtype),
+            hidden_states_visual=img_tokens.to(self.dtype),
+            timestep_action=timesteps,
+            timestep_video=None,
+            encoder_hidden_states=lang_tokens.to(self.dtype),
+            value=None,
+            video_kv_mask_mode=video_kv_mask_mode,
+            return_dict=False,
+        )
+        pred_action = pred_action[:, :key_len]
+        target_action = (noise_for_action - key_action_gt).to(self.dtype)
+        if self.prediction_type == "velocity":
+            v_pred = pred_action.to(self.dtype)
+        elif self.prediction_type == "sample":
+            v_pred = (noise_for_action - pred_action).to(self.dtype)
+        elif self.prediction_type == "noise":
+            v_pred = (pred_action - key_action_gt).to(self.dtype)
+        else:
+            v_pred = pred_action.to(self.dtype)
+        loss_key_action = self._masked_mse(v_pred, target_action, key_valid_mask)
+        pred_key_action = self._clean_action_from_diffusion_pred(
+            pred_action=pred_action.to(key_action_gt.dtype),
+            noise_for_action=noise_for_action,
+            noisy_action=noisy_action,
+        )
+        return loss_key_action, pred_key_action
+
+    def _compute_goal_key_video_diffusion_loss(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        video_latents: torch.Tensor,
+        condition_video_latents: torch.Tensor,
+        video_kv_mask_mode: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        current_anchor = video_latents[:, :, -1:]
+        current_condition = self._video_condition_with_anchor(condition_video_latents, current_anchor)
+        (
+            noise_for_video,
+            noisy_video_hidden,
+            timesteps_for_video,
+            per_element_loss_mask,
+        ) = _video_train_diffusion_prep(
+            self.noise_scheduler_video,
+            video_latents,
+            current_condition,
+            self.dtype,
+            wan22=self._video_expert_is_wan22,
+        )
+        pred_video, pred_action_unused = self.model(
+            hidden_states_video=noisy_video_hidden.to(self.dtype),
+            hidden_states_action=None,
+            hidden_states_robostate=None,
+            hidden_states_visual=None,
+            timestep_action=None,
+            timestep_video=timesteps_for_video,
+            encoder_hidden_states=lang_tokens.to(self.dtype),
+            value=None,
+            video_kv_mask_mode=video_kv_mask_mode,
+            return_dict=False,
+        )
+        del pred_action_unused
+        target_video = (noise_for_video - video_latents).to(self.dtype)
+        key_loss_elem = F.mse_loss(pred_video[:, :, :1], target_video[:, :, :1], reduction="none")
+        if per_element_loss_mask is not None:
+            key_mask = per_element_loss_mask[:, :, :1]
+            loss_key_video = (key_loss_elem * key_mask).sum() / key_mask.sum().clamp_min(1.0)
+        else:
+            loss_key_video = key_loss_elem.mean()
+        pred_key_video = (noise_for_video[:, :, :1] - pred_video[:, :, :1].to(noise_for_video.dtype))
+        return loss_key_video, pred_key_video.to(video_latents.dtype)
+
+    def _compute_goal_reverse_action_diffusion_loss(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        img_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        action_gt: torch.Tensor,
+        action_mask: torch.Tensor,
+        value: Optional[torch.Tensor],
+        action_valid_mask: Optional[torch.Tensor],
+        pred_key_action: Optional[torch.Tensor],
+        video_kv_mask_mode: str,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_size = lang_tokens.shape[0]
+        device = lang_tokens.device
+        noise_for_action = torch.randn(action_gt.shape, dtype=action_gt.dtype, device=device)
+        noise_for_value = torch.randn(value.shape, dtype=value.dtype, device=device) if self.use_value else None
+        _sigmas, timesteps = self.noise_scheduler_action.sample(batch_size, device=device)
+        noisy_action = self.noise_scheduler_action.add_noise(action_gt, noise_for_action, timesteps)
+        if (
+            pred_key_action is not None
+            and self.use_predicted_key_condition
+            and self.reverse_action_key_condition_type in ("prefix", "replace_first")
+        ):
+            key_len = min(pred_key_action.shape[1], noisy_action.shape[1])
+            noisy_action = noisy_action.clone()
+            noisy_action[:, :key_len] = pred_key_action[:, :key_len].to(noisy_action.dtype)
+        noisy_value = (
+            self.noise_scheduler_action.add_noise(value, noise_for_value, timesteps)
+            if self.use_value
+            else None
+        )
+        action_mask_expanded = action_mask.expand(-1, noisy_action.shape[1], -1)
+        _pred_video_unused, pred_action = self.model(
+            hidden_states_video=None,
+            hidden_states_action=torch.cat([noisy_action, action_mask_expanded], dim=2).to(self.dtype),
+            hidden_states_robostate=torch.cat([state_tokens, action_mask], dim=2).to(self.dtype),
+            hidden_states_visual=img_tokens.to(self.dtype),
+            timestep_action=timesteps,
+            timestep_video=None,
+            encoder_hidden_states=lang_tokens.to(self.dtype),
+            value=torch.cat([noisy_value, action_mask], dim=2).to(self.dtype) if self.use_value else None,
+            video_kv_mask_mode=video_kv_mask_mode,
+            return_dict=False,
+        )
+        if self.use_value and value is not None:
+            pred_value = pred_action[:, -1:]
+            pred_action = pred_action[:, :-1]
+            target_value = (noise_for_value - value).to(self.dtype)
+        else:
+            pred_value = None
+            target_value = None
+        target_action = (noise_for_action - action_gt).to(self.dtype)
+        if self.prediction_type == "velocity":
+            v_pred = pred_action.to(self.dtype)
+            v_pred_value = pred_value.detach().to(self.dtype) if pred_value is not None else None
+        elif self.prediction_type == "sample":
+            v_pred = (noise_for_action - pred_action).to(self.dtype)
+            v_pred_value = (
+                (noise_for_value.detach() - pred_value.detach()).to(self.dtype)
+                if pred_value is not None
+                else None
+            )
+        elif self.prediction_type == "noise":
+            v_pred = (pred_action - action_gt).to(self.dtype)
+            v_pred_value = (
+                (pred_value.detach() - value).to(self.dtype)
+                if pred_value is not None
+                else None
+            )
+        else:
+            v_pred = pred_action.to(self.dtype)
+            v_pred_value = pred_value.detach().to(self.dtype) if pred_value is not None else None
+        loss_action = self._masked_mse(v_pred, target_action, action_valid_mask)
+        loss_value = (
+            F.mse_loss(v_pred_value, target_value.detach())
+            if self.use_value and v_pred_value is not None and target_value is not None
+            else None
+        )
+        return loss_action, loss_value
+
+    def _compute_goal_conditioned_diffusion_loss(
+        self,
+        *,
+        lang_tokens: torch.Tensor,
+        img_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        action_gt: torch.Tensor,
+        action_mask: torch.Tensor,
+        value: Optional[torch.Tensor],
+        video_latents: torch.Tensor,
+        condition_video_latents: torch.Tensor,
+        action_valid_mask: Optional[torch.Tensor],
+        video_kv_mask_mode: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        zero = action_gt.new_zeros(())
+        if self.goal_joint_key_diffusion:
+            (
+                loss_key_video,
+                loss_key_action,
+                pred_key_video,
+                pred_key_action,
+            ) = self._compute_goal_joint_key_diffusion_loss(
+                lang_tokens=lang_tokens,
+                img_tokens=img_tokens,
+                state_tokens=state_tokens,
+                action_gt=action_gt,
+                action_mask=action_mask,
+                action_valid_mask=action_valid_mask,
+                video_latents=video_latents,
+                condition_video_latents=condition_video_latents,
+                video_kv_mask_mode=video_kv_mask_mode,
+            )
+        elif self.predict_key_video:
+            loss_key_video, pred_key_video = self._compute_goal_key_video_diffusion_loss(
+                lang_tokens=lang_tokens,
+                video_latents=video_latents,
+                condition_video_latents=condition_video_latents,
+                video_kv_mask_mode=video_kv_mask_mode,
+            )
+        else:
+            loss_key_video = zero
+            pred_key_video = video_latents[:, :, :1]
+        if not self.goal_joint_key_diffusion:
+            if self.predict_key_action:
+                loss_key_action, pred_key_action = self._compute_goal_key_action_diffusion_loss(
+                    lang_tokens=lang_tokens,
+                    img_tokens=img_tokens,
+                    state_tokens=state_tokens,
+                    action_gt=action_gt,
+                    action_mask=action_mask,
+                    action_valid_mask=action_valid_mask,
+                    video_kv_mask_mode=video_kv_mask_mode,
+                )
+            else:
+                loss_key_action = zero
+                key_len = max(1, min(self.key_action_chunk_size, action_gt.shape[1]))
+                pred_key_action = action_gt[:, :key_len]
+        if self.detach_predicted_key_condition:
+            pred_key_video = pred_key_video.detach()
+            pred_key_action = pred_key_action.detach()
+        if self.goal_joint_reverse_diffusion:
+            (
+                loss_reverse_action,
+                loss_reverse_video,
+                loss_value,
+            ) = self._compute_goal_joint_reverse_diffusion_loss(
+                lang_tokens=lang_tokens,
+                img_tokens=img_tokens,
+                state_tokens=state_tokens,
+                action_gt=action_gt,
+                action_mask=action_mask,
+                value=value,
+                action_valid_mask=action_valid_mask,
+                video_latents=video_latents,
+                condition_video_latents=condition_video_latents,
+                pred_key_video=pred_key_video,
+                pred_key_action=pred_key_action,
+                video_kv_mask_mode=video_kv_mask_mode,
+            )
+        else:
+            reverse_condition = condition_video_latents
+            if self.use_predicted_key_condition and self.reverse_video_key_condition_type in (
+                "latent_inpainting",
+                "first_frame",
+                "anchor",
+            ):
+                reverse_condition = self._video_condition_with_anchor(
+                    condition_video_latents, pred_key_video
+                )
+            loss_reverse_video = self._compute_video_diffusion_loss(
+                lang_tokens=lang_tokens,
+                video_latents=video_latents,
+                condition_video_latents=reverse_condition,
+                video_kv_mask_mode=video_kv_mask_mode,
+            )
+            loss_reverse_action, loss_value = self._compute_goal_reverse_action_diffusion_loss(
+                lang_tokens=lang_tokens,
+                img_tokens=img_tokens,
+                state_tokens=state_tokens,
+                action_gt=action_gt,
+                action_mask=action_mask,
+                value=value,
+                action_valid_mask=action_valid_mask,
+                pred_key_action=pred_key_action,
+                video_kv_mask_mode=video_kv_mask_mode,
+            )
+        loss_action = (
+            self.key_action_loss_weight * loss_key_action
+            + self.reverse_action_loss_weight * loss_reverse_action
+        )
+        loss_video = (
+            self.key_video_loss_weight * loss_key_video
+            + self.reverse_video_loss_weight * loss_reverse_video
+        )
+        self.last_goal_conditioned_metrics = {
+            "loss_gc_key_video": loss_key_video.detach(),
+            "loss_gc_key_action": loss_key_action.detach(),
+            "loss_gc_reverse_video": loss_reverse_video.detach(),
+            "loss_gc_reverse_action": loss_reverse_action.detach(),
+            "loss_gc_video_main": loss_video.detach(),
+            "loss_gc_action_main": loss_action.detach(),
+        }
+        return loss_action, loss_video, loss_value
+
     def _compute_stage3_coa_action_latent_loss(
         self,
         *,
@@ -1159,8 +2351,23 @@ class FMPRunner(nn.Module,
         self.last_stage2_metrics = {}
         self.last_stage3_metrics = {}
         self.last_stage4_metrics = {}
+        self.last_goal_conditioned_metrics = {}
         stage2_action_gt = action_gt
         stage2_action_valid_mask = action_valid_mask
+
+        if self.goal_conditioned_wam:
+            return self._compute_goal_conditioned_diffusion_loss(
+                lang_tokens=lang_tokens,
+                img_tokens=img_tokens,
+                state_tokens=state_tokens,
+                action_gt=action_gt,
+                action_mask=action_mask,
+                value=value,
+                video_latents=video_latents,
+                condition_video_latents=condition_video_latents,
+                action_valid_mask=action_valid_mask,
+                video_kv_mask_mode=video_kv_mask_mode,
+            )
 
         if self.stage4_full_coa_ar:
             if self.stage4_replace_action_diffusion:
@@ -1546,6 +2753,22 @@ class FMPRunner(nn.Module,
                 video_latents = video_latents.repeat(sample_batch_size, 1, 1, 1, 1)
             if condition_video_latents is not None:
                 condition_video_latents = condition_video_latents.repeat(sample_batch_size, 1, 1, 1, 1)
+
+        if self.goal_conditioned_wam and self.goal_conditioned_multistep_inference:
+            return self.conditional_sample_goal_conditioned_reverse_diffusion(
+                lang_tokens=lang_tokens,
+                lang_attn_mask=lang_attn_mask,
+                img_tokens=img_tokens,
+                state_tokens=state_tokens,
+                action_mask=action_mask,
+                ctrl_freqs=ctrl_freqs,
+                video_latents=video_latents,
+                condition_video_latents=condition_video_latents,
+                video_only=video_only,
+                action_only=action_only,
+                seed=seed,
+                num_inference_timesteps=num_inference_timesteps,
+            )
 
         # (1) 准备输入
         # (2) 调用扩散采样
