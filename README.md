@@ -39,7 +39,7 @@
 
 ## 功能概览
 
-- **World 训练**：因果注意力下的多模态世界策略（含 value 分支），HDF5 / buffer 数据管线。
+- **World 训练**：只保留 Original、Independent Goal Reverse、Joint Goal Reverse 三种 diffusion variant。
 - **Video-only 训练**：单独训练 Video Expert（Wan），数据使用 `VideoDataset`。
 - **配置**：`model_config/*.yml`（schema v2）+ `configs/` 下结构 YAML 与数据集 JSON。
 
@@ -81,11 +81,14 @@ accelerate config    # 首次建议配置分布式默认值
 在 **`WAM/`** 根目录执行：
 
 ```bash
-# World
-accelerate launch main_world.py --model_config_path model_config/<你的配置>.yml
+# Original WVWAM
+accelerate launch main_world.py --model_config_path validation_tmp/original_wvwam.yml
 
-# 或使用本地封装（CONFIG_NAME 不含 .yml）
-./train_wam_local.sh <CONFIG_NAME>
+# Independent Goal-Conditioned Reverse Diffusion
+accelerate launch main_world.py --model_config_path validation_tmp/goal_reverse_independent.yml
+
+# Joint Goal-Conditioned Reverse Diffusion
+accelerate launch main_world.py --model_config_path validation_tmp/goal_reverse_joint.yml
 
 # 仅 Video Expert
 accelerate launch main_video.py --model_config_path model_config/<你的配置>.yml
@@ -96,7 +99,7 @@ accelerate launch main_video.py --model_config_path model_config/<你的配置>.
 ### 自检
 
 ```bash
-python -c "from wam.trainers.train_world import train; print('import ok')"
+PYTHONPATH=. python scripts/smoke_three_world_variants.py
 ```
 
 ---

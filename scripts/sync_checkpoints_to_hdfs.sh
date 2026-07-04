@@ -11,7 +11,7 @@ Options:
                          hdfs:///user/$USER/reverse_world_model/checkpoints
   --local-root PATH      Local checkpoint root. Default: checkpoints
   --run-name NAME        Upload only one run directory under local-root.
-                         Example: validation-stage3-1-coa-action-loss
+                         Example: validation-goal-conditioned-joint-reverse-diffusion
   --checkpoint NAME      Upload only one checkpoint directory under run-name.
                          Example: checkpoint-1000
   --dry-run             Print what would be uploaded without writing to HDFS.
@@ -24,11 +24,11 @@ Examples:
 
   scripts/sync_checkpoints_to_hdfs.sh \
     --hdfs-root hdfs:///user/$USER/reverse_world_model/checkpoints \
-    --run-name validation-stage3-1-coa-action-loss
+    --run-name validation-goal-conditioned-joint-reverse-diffusion
 
   scripts/sync_checkpoints_to_hdfs.sh \
     --hdfs-root hdfs:///user/$USER/reverse_world_model/checkpoints \
-    --run-name validation-stage3-1-coa-action-loss \
+    --run-name validation-goal-conditioned-joint-reverse-diffusion \
     --checkpoint checkpoint-1000
 EOF
 }

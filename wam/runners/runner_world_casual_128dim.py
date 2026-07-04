@@ -57,6 +57,39 @@ def _pick_pretrained_path(kwargs_value, config, attr_name: str):
     return cfg_v
 
 
+WORLD_GENERATION_VARIANTS = frozenset(
+    {
+        "original",
+        "goal_reverse_independent",
+        "goal_reverse_joint",
+    }
+)
+
+
+def resolve_world_generation_variant(config) -> str:
+    """Resolve the canonical variant, including legacy Goal config booleans."""
+    configured_variant = config.get("world_generation_variant", None)
+    if configured_variant is None:
+        legacy_goal_conditioned = bool(config.get("goal_conditioned_wam", False))
+        legacy_joint = bool(
+            config.get("goal_joint_key_diffusion", False)
+            or config.get("goal_joint_reverse_diffusion", False)
+        )
+        if not legacy_goal_conditioned:
+            configured_variant = "original"
+        elif legacy_joint:
+            configured_variant = "goal_reverse_joint"
+        else:
+            configured_variant = "goal_reverse_independent"
+    variant = str(configured_variant).strip().lower()
+    if variant not in WORLD_GENERATION_VARIANTS:
+        raise ValueError(
+            f"Unsupported world_generation_variant={variant!r}; "
+            f"expected one of {sorted(WORLD_GENERATION_VARIANTS)}."
+        )
+    return variant
+
+
 class FMPRunner(nn.Module,
                 CompatiblePyTorchModelHubMixin,):
 
@@ -160,55 +193,8 @@ class FMPRunner(nn.Module,
         self.action_dim = config['action_expert']['out_action_dim']
         self.state_token_dim = config['state_token_dim']
         self.video_pred_horizon = pred_horizon // sample_fps
-        self.stage2_enable_reverse_ar_action = bool(config.get("stage2_enable_reverse_ar_action", False))
-        self.stage2_key_action_loss_weight = float(config.get("stage2_key_action_loss_weight", 0.0))
-        self.stage2_reverse_ar_action_loss_weight = float(
-            config.get("stage2_reverse_ar_action_loss_weight", 0.0)
-        )
-        self.last_stage2_metrics = {}
-        self.generation_mode = str(config.get("generation_mode", "diffusion")).strip().lower()
-        if self.generation_mode not in ("diffusion", "reverse_ar"):
-            raise ValueError(
-                f"Unsupported generation_mode={self.generation_mode!r}; "
-                "expected 'diffusion' or 'reverse_ar'."
-            )
-        self.stage3_predict_keyframe = bool(config.get("stage3_predict_keyframe", False))
-        self.stage3_predict_key_action = bool(config.get("stage3_predict_key_action", False))
-        self.stage3_replace_video_diffusion = bool(config.get("stage3_replace_video_diffusion", False))
-        self.stage3_replace_action_diffusion = bool(config.get("stage3_replace_action_diffusion", False))
-        self.stage3_video_ar_causal_attention = bool(config.get("stage3_video_ar_causal_attention", False))
-        self.stage3_action_ar_causal_attention = bool(config.get("stage3_action_ar_causal_attention", True))
-        self.stage3_keyframe_loss_weight = float(config.get("stage3_keyframe_loss_weight", 1.0))
-        self.stage3_video_ar_loss_weight = float(config.get("stage3_video_ar_loss_weight", 1.0))
-        self.stage3_key_action_loss_weight = float(config.get("stage3_key_action_loss_weight", 1.0))
-        self.stage3_action_ar_loss_weight = float(config.get("stage3_action_ar_loss_weight", 1.0))
-        self.stage3_use_coa_action_loss = bool(config.get("stage3_use_coa_action_loss", False))
-        self.stage3_action_latent_loss_weight = float(config.get("stage3_action_latent_loss_weight", 0.1))
-        self.stage3_action_latent_detach_target = bool(
-            config.get("stage3_action_latent_detach_target", True)
-        )
-        self.stage3_use_scheduled_sampling = bool(config.get("stage3_use_scheduled_sampling", False))
-        self.stage3_key_teacher_forcing_prob_start = float(
-            config.get("stage3_key_teacher_forcing_prob_start", 1.0)
-        )
-        self.stage3_key_teacher_forcing_prob_end = float(
-            config.get("stage3_key_teacher_forcing_prob_end", 0.0)
-        )
-        self.stage3_key_teacher_forcing_decay_steps = int(
-            config.get("stage3_key_teacher_forcing_decay_steps", 20000)
-        )
-        self.last_stage3_metrics = {}
-        self.stage4_full_coa_ar = bool(config.get("stage4_full_coa_ar", False))
-        self.stage4_replace_video_diffusion = bool(config.get("stage4_replace_video_diffusion", False))
-        self.stage4_replace_action_diffusion = bool(config.get("stage4_replace_action_diffusion", False))
-        self.stage4_keyframe_loss_weight = float(config.get("stage4_keyframe_loss_weight", 1.0))
-        self.stage4_video_ar_loss_weight = float(config.get("stage4_video_ar_loss_weight", 1.0))
-        self.stage4_key_action_loss_weight = float(config.get("stage4_key_action_loss_weight", 1.0))
-        self.stage4_action_ar_loss_weight = float(config.get("stage4_action_ar_loss_weight", 1.0))
-        self.stage4_action_latent_loss_weight = float(config.get("stage4_action_latent_loss_weight", 0.1))
-        self.stage4_action_latent_detach_target = bool(config.get("stage4_action_latent_detach_target", True))
-        self.last_stage4_metrics = {}
-        self.goal_conditioned_wam = bool(config.get("goal_conditioned_wam", False))
+        self.world_generation_variant = resolve_world_generation_variant(config)
+        self.goal_conditioned_wam = self.world_generation_variant != "original"
         self.predict_key_video = bool(config.get("predict_key_video", True))
         self.predict_key_action = bool(config.get("predict_key_action", True))
         self.key_action_chunk_size = int(config.get("key_action_chunk_size", 4))
@@ -225,6 +211,12 @@ class FMPRunner(nn.Module,
         self.reverse_video_loss_weight = float(config.get("reverse_video_loss_weight", 1.0))
         self.reverse_action_loss_weight = float(config.get("reverse_action_loss_weight", 1.0))
         self.reverse_world_order = bool(config.get("reverse_world_order", False))
+        expected_reverse = self.world_generation_variant != "original"
+        if self.reverse_world_order != expected_reverse:
+            raise ValueError(
+                f"{self.world_generation_variant} requires "
+                f"reverse_world_order={str(expected_reverse).lower()}."
+            )
         self.goal_conditioned_multistep_inference = bool(
             config.get("goal_conditioned_multistep_inference", False)
         )
@@ -234,12 +226,33 @@ class FMPRunner(nn.Module,
         self.goal_conditioned_video_guidance_scale = float(
             config.get("goal_conditioned_video_guidance_scale", 5.0)
         )
-        self.goal_joint_key_diffusion = bool(
-            config.get("goal_joint_key_diffusion", False)
+        self.goal_joint_key_diffusion = (
+            self.world_generation_variant == "goal_reverse_joint"
         )
-        self.goal_joint_reverse_diffusion = bool(
-            config.get("goal_joint_reverse_diffusion", False)
+        self.goal_joint_reverse_diffusion = self.goal_joint_key_diffusion
+        video_causal = bool(
+            getattr(self.model.video_expert, "frame_causal_self_attention", False)
         )
+        action_causal = bool(
+            getattr(self.model.action_expert, "frame_causal_self_attention", False)
+        )
+        action_video_causal = bool(
+            getattr(self.model, "action_video_frame_causal_kv", False)
+        )
+        expected_self_causal = self.goal_conditioned_wam
+        expected_action_video_causal = self.goal_joint_key_diffusion
+        actual_profile = (video_causal, action_causal, action_video_causal)
+        expected_profile = (
+            expected_self_causal,
+            expected_self_causal,
+            expected_action_video_causal,
+        )
+        if actual_profile != expected_profile:
+            raise ValueError(
+                f"{self.world_generation_variant} requires causal profile "
+                f"(video_self, action_self, action_to_video)={expected_profile}, "
+                f"got {actual_profile}."
+            )
         if (
             self.goal_conditioned_wam
             and self.goal_joint_key_diffusion
@@ -250,22 +263,6 @@ class FMPRunner(nn.Module,
                 "predict_key_video=true and predict_key_action=true."
             )
         self.last_goal_conditioned_metrics = {}
-        lang_token_dim = int(config.get("lang_token_dim", config.action_expert.get("text_dim", 4096)))
-        self.stage4_video_lang_proj = nn.Linear(lang_token_dim, self._noise_video_channels)
-        self.stage4_video_state_proj = nn.Linear(self.state_token_dim, self._noise_video_channels)
-        self.stage4_video_sos = nn.Parameter(torch.zeros(1, self._noise_video_channels, 1, 1, 1))
-        self.stage4_video_ar_head = nn.Sequential(
-            nn.Conv3d(self._noise_video_channels, self._noise_video_channels, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv3d(self._noise_video_channels, self._noise_video_channels, kernel_size=1),
-        )
-        if self.generation_mode == "reverse_ar" and self.stage3_action_ar_causal_attention:
-            action_expert = getattr(self.model, "action_expert", None)
-            if action_expert is not None and not getattr(action_expert, "frame_causal_self_attention", False):
-                raise ValueError(
-                    "generation_mode=reverse_ar requires action_expert.frame_causal_self_attention=true. "
-                    "Set architecture.model.action_expert.frame_causal_self_attn: true."
-                )
 
         print("FMPRunner params: %e" %
               sum([p.numel() for p in self.model.parameters()]))
@@ -1172,159 +1169,6 @@ class FMPRunner(nn.Module,
             noisy_video[:, :, :1] = video_latents[:, :, :1]
         return noisy_video, 0 if denoise_steps is None else timesteps_video[n_run]
 
-    def conditional_sample_video_then_action(
-        self,
-        lang_tokens,
-        lang_attn_mask,
-        img_tokens,
-        state_tokens,
-        action_mask,
-        ctrl_freqs,
-        video_latents,
-        condition_video_latents,
-        seed: Optional[int] = 42,
-        guidance_scale_action: float = 1.0,
-        use_cfg_action: bool = False,
-        video_denoise_steps: Optional[int] = None,
-        num_inference_timesteps: Optional[int] = None,
-        use_mean_flow: bool = False,
-    ):
-        """
-        两阶段采样：先仅对视频分支做完整去噪得到 ``noisy_video``（此处为去噪后的视频 latent），
-        再固定该视频与 ``condition_video_latents`` 拼接后的 ``hidden_states_video``，
-        仅对 action（及 ``use_value`` 时的 value）做扩散去噪；视频分支不再更新。
-
-        video_denoise_steps: 第一阶段视频去噪步数上限，``None`` 表示与 ``num_inference_timesteps`` 一致。
-
-        Returns:
-            dict: ``pred_trajectory``, ``pred_video``（第一阶段输出）, ``pred_value``（可选）
-        """
-        del lang_attn_mask, ctrl_freqs
-
-        device = lang_tokens.device
-        dtype = lang_tokens.dtype
-        state_tokens = state_tokens.to(device, dtype=dtype)
-        batch_size = state_tokens.shape[0]
-
-        # ---------- 1) 视频先去噪 ----------
-        noisy_video, t_video = self.conditional_sample_video_only(
-            lang_tokens,
-            video_latents,
-            condition_video_latents,
-            denoise_steps=video_denoise_steps,
-            seed=42 if seed is None else int(seed),
-            num_inference_timesteps=num_inference_timesteps,
-        )
-        # 拼接条件视频通道；去噪结束后视频条件用 scheduler 的最末时刻（最小噪声）
-        # self.noise_scheduler_sample_video.set_timesteps(self.num_inference_timesteps, device=device)
-        # timesteps_video = self.noise_scheduler_sample_video.timesteps
-        # t_video_clean = timesteps_video[-1]
-        hidden_states_video = (
-            noisy_video
-            if self._video_expert_is_wan22
-            else torch.concat([noisy_video, condition_video_latents], dim=1)
-        )
-        timestep_video = self._timestep_video_tensor(t_video, batch_size, device, noisy_video)
-
-        # ---------- 2) 再对 action 去噪 ----------
-        generator: Optional[torch.Generator] = None
-        if seed is not None:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(int(seed))
-
-        noisy_action = torch.randn(
-            size=(
-                batch_size,
-                self.pred_horizon + 1 if self.use_value else self.pred_horizon,
-                self.state_token_dim,
-            ),
-            dtype=dtype,
-            device=device,
-            generator=generator,
-        )
-        noise_action = noisy_action.clone()
-        if self.use_value:
-            noisy_value = noisy_action[:, -1:]
-            noisy_action = noisy_action[:, :-1]
-            noise_value = noise_action[:, -1:]
-            noise_action = noise_action[:, :-1]
-        else:
-            noisy_value = None
-            noise_value = None
-
-        action_mask_expanded = action_mask.expand(-1, self.pred_horizon, -1)
-        num_inf = num_inference_timesteps if num_inference_timesteps is not None else self.num_inference_timesteps
-        timesteps = self.noise_scheduler_sample_action.set_timesteps(num_inf)
-        uncond_lang_tokens = torch.load(
-            _DEMO_UNCOND_PT, map_location="cpu"
-        ).to(device, torch.bfloat16)
-
-        for idx, t_action in enumerate(timesteps):
-            timestep_action = (torch.ones(batch_size, device=device) * t_action).long()
-            _, action_velocity_pred = self.model(
-                hidden_states_action=torch.cat([noisy_action, action_mask_expanded], dim=2),
-                hidden_states_robostate=torch.cat([state_tokens, action_mask], dim=2),
-                hidden_states_video=hidden_states_video,
-                hidden_states_visual=img_tokens,
-                timestep_action=timestep_action,
-                timestep_video=timestep_video,
-                encoder_hidden_states=lang_tokens,
-                value=torch.cat([noisy_value, action_mask], dim=2) if self.use_value else noisy_value,
-                video_kv_mask_mode='off',
-                return_dict=False,
-            )
-            if use_cfg_action:
-                _, uncond_action_velocity_pred = self.model(
-                    hidden_states_action=torch.cat([noisy_action, action_mask_expanded], dim=2),
-                    hidden_states_robostate=torch.cat([state_tokens, action_mask], dim=2),
-                    hidden_states_video=hidden_states_video,
-                    hidden_states_visual=img_tokens,
-                    timestep_action=timestep_action,
-                    timestep_video=timestep_video,
-                    encoder_hidden_states=uncond_lang_tokens,
-                    value=torch.cat([noisy_value, action_mask], dim=2) if self.use_value else noisy_value,
-                    video_kv_mask_mode='off',
-                    return_dict=False,
-                )
-                action_velocity_pred = uncond_action_velocity_pred + guidance_scale_action * (
-                    action_velocity_pred - uncond_action_velocity_pred
-                )
-
-            if self.noise_scheduler_type != "ddpm":
-                if self.prediction_type == "sample":
-                    if self.use_value:
-                        value_velocity_pred = action_velocity_pred[:, -1:]
-                        action_velocity_pred = action_velocity_pred[:, :-1]
-                        noisy_value = self.noise_scheduler_sample_action.step(
-                            noise_value - value_velocity_pred, t_action, noisy_value
-                        )
-                    noisy_action = self.noise_scheduler_sample_action.step(
-                        (noise_action - action_velocity_pred) / (t_action * 0.001)
-                        if use_mean_flow
-                        else (noise_action - action_velocity_pred),
-                        t_action,
-                        noisy_action,
-                    )
-                else:
-                    noisy_action = self.noise_scheduler_sample_action.step(
-                        action_velocity_pred, t_action, noisy_action
-                    )
-            else:
-                noisy_action = self.noise_scheduler_sample_action.step(
-                    action_velocity_pred, t_action, noisy_action
-                ).prev_sample
-
-            noisy_action = noisy_action.to(state_tokens.dtype)
-            noisy_value = noisy_value.to(state_tokens.dtype) if self.use_value else None
-
-        # Apply action mask to zero out invalid action dimensions (mirrors official RDT)
-        noisy_action = noisy_action * action_mask_expanded
-        return {
-            "pred_trajectory": noisy_action,
-            "pred_video": noisy_video,
-            "pred_value": noisy_value if self.use_value else None,
-        }
-
     def _masked_mse(
         self,
         pred: torch.Tensor,
@@ -1337,78 +1181,6 @@ class FMPRunner(nn.Module,
         loss_elem = F.mse_loss(pred, target, reduction="none")
         denom = valid.expand_as(loss_elem).sum().clamp_min(1.0)
         return (loss_elem * valid).sum() / denom
-
-    def _compute_stage2_reverse_ar_action_loss(
-        self,
-        *,
-        lang_tokens: torch.Tensor,
-        img_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
-        action_gt: torch.Tensor,
-        action_mask: torch.Tensor,
-        action_valid_mask: Optional[torch.Tensor],
-        video_kv_mask_mode: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Teacher-forced CoA-style reverse action loss.
-
-        ``action_gt`` is already in the training view. With ``reverse_world_order=true``,
-        token 0 is the semantic key action. The decoder input is shifted right with an
-        all-zero SOS action token; causal action attention can then learn
-        ``SOS -> key action -> previous action -> ...``.
-        """
-        pred_action_ar, target_action = self._predict_reverse_ar_action_teacher_forced(
-            lang_tokens=lang_tokens,
-            img_tokens=img_tokens,
-            state_tokens=state_tokens,
-            action_gt=action_gt,
-            action_mask=action_mask,
-            video_kv_mask_mode=video_kv_mask_mode,
-        )
-        reverse_ar_loss = self._masked_mse(pred_action_ar, target_action, action_valid_mask)
-        key_valid_mask = (
-            action_valid_mask[:, :1]
-            if action_valid_mask is not None
-            else None
-        )
-        key_action_loss = self._masked_mse(pred_action_ar[:, :1], target_action[:, :1], key_valid_mask)
-        return key_action_loss, reverse_ar_loss
-
-    def _predict_reverse_ar_action_teacher_forced(
-        self,
-        *,
-        lang_tokens: torch.Tensor,
-        img_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
-        action_gt: torch.Tensor,
-        action_mask: torch.Tensor,
-        video_kv_mask_mode: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, horizon, _ = action_gt.shape
-        sos = torch.zeros_like(action_gt[:, :1])
-        shifted_action = torch.cat([sos, action_gt[:, :-1]], dim=1)
-        action_mask_expanded = action_mask.expand(-1, horizon, -1)
-        timestep_action = torch.zeros(batch_size, device=action_gt.device, dtype=torch.long)
-        ar_value = None
-        if self.use_value:
-            zero_value = torch.zeros_like(action_gt[:, :1])
-            ar_value = torch.cat([zero_value, action_mask], dim=2)
-
-        pred_video_unused, pred_action_ar = self.model(
-            hidden_states_video=None,
-            hidden_states_action=torch.cat([shifted_action, action_mask_expanded], dim=2).to(self.dtype),
-            hidden_states_robostate=torch.cat([state_tokens, action_mask], dim=2).to(self.dtype),
-            hidden_states_visual=img_tokens.to(self.dtype),
-            timestep_action=timestep_action,
-            timestep_video=None,
-            encoder_hidden_states=lang_tokens.to(self.dtype),
-            value=ar_value.to(self.dtype) if ar_value is not None else None,
-            video_kv_mask_mode=video_kv_mask_mode,
-            return_dict=False,
-        )
-        del pred_video_unused
-        pred_action_ar = pred_action_ar[:, :horizon].to(action_gt.dtype)
-        target_action = action_gt.to(pred_action_ar.dtype)
-        return pred_action_ar, target_action
 
     def _compute_video_diffusion_loss(
         self,
@@ -1449,138 +1221,6 @@ class FMPRunner(nn.Module,
         return (
             F.mse_loss(pred_video, target_video, reduction="none") * per_element_loss_mask
         ).sum() / per_element_loss_mask.sum()
-
-    def _stage4_video_condition(
-        self,
-        *,
-        lang_tokens: torch.Tensor,
-        state_tokens: Optional[torch.Tensor],
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        lang_cond = self.stage4_video_lang_proj(lang_tokens.mean(dim=1).to(self.stage4_video_lang_proj.weight.dtype))
-        if state_tokens is not None:
-            state_cond = self.stage4_video_state_proj(
-                state_tokens[:, 0].to(self.stage4_video_state_proj.weight.dtype)
-            )
-            lang_cond = lang_cond + state_cond
-        return lang_cond.to(dtype).view(lang_tokens.shape[0], self._noise_video_channels, 1, 1, 1)
-
-    def _predict_stage4_video_ar_teacher_forced(
-        self,
-        *,
-        lang_tokens: torch.Tensor,
-        state_tokens: Optional[torch.Tensor],
-        video_latents: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        target_video = video_latents[:, : self._noise_video_channels].to(self.dtype)
-        batch_size, channels, frames, height, width = target_video.shape
-        sos = self.stage4_video_sos.to(device=target_video.device, dtype=target_video.dtype)
-        sos = sos.expand(batch_size, channels, 1, height, width)
-        shifted_video = torch.cat([sos, target_video[:, :, :-1]], dim=2)
-        cond = self._stage4_video_condition(
-            lang_tokens=lang_tokens,
-            state_tokens=state_tokens,
-            dtype=target_video.dtype,
-        )
-        head_dtype = next(self.stage4_video_ar_head.parameters()).dtype
-        pred_video = self.stage4_video_ar_head(shifted_video.to(head_dtype)).to(target_video.dtype) + cond
-        return pred_video.to(video_latents.dtype), target_video.to(video_latents.dtype)
-
-    def _compute_stage4_video_ar_loss(
-        self,
-        *,
-        lang_tokens: torch.Tensor,
-        state_tokens: Optional[torch.Tensor],
-        video_latents: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pred_video, target_video = self._predict_stage4_video_ar_teacher_forced(
-            lang_tokens=lang_tokens,
-            state_tokens=state_tokens,
-            video_latents=video_latents,
-        )
-        video_ar_loss = F.mse_loss(pred_video, target_video)
-        keyframe_loss = F.mse_loss(pred_video[:, :, :1], target_video[:, :, :1])
-        loss_video = (
-            self.stage4_keyframe_loss_weight * keyframe_loss
-            + self.stage4_video_ar_loss_weight * video_ar_loss
-        )
-        return loss_video, keyframe_loss, video_ar_loss
-
-    def _compute_action_diffusion_loss(
-        self,
-        *,
-        lang_tokens: torch.Tensor,
-        img_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
-        action_gt: torch.Tensor,
-        action_mask: torch.Tensor,
-        value: Optional[torch.Tensor],
-        action_valid_mask: Optional[torch.Tensor],
-        video_kv_mask_mode: str,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        batch_size = lang_tokens.shape[0]
-        device = lang_tokens.device
-        noise_for_action = torch.randn(action_gt.shape, dtype=action_gt.dtype, device=device)
-        noise_for_value = torch.randn(value.shape, dtype=value.dtype, device=device) if self.use_value else None
-        _sigmas_for_action, timesteps_for_action = self.noise_scheduler_action.sample(batch_size, device=device)
-        noisy_action = self.noise_scheduler_action.add_noise(action_gt, noise_for_action, timesteps_for_action)
-        noisy_value = (
-            self.noise_scheduler_action.add_noise(value, noise_for_value, timesteps_for_action)
-            if self.use_value
-            else None
-        )
-        action_mask_expanded = action_mask.expand(-1, noisy_action.shape[1], -1)
-        _pred_video_unused, pred_action = self.model(
-            hidden_states_video=None,
-            hidden_states_action=torch.cat([noisy_action, action_mask_expanded], dim=2).to(self.dtype),
-            hidden_states_robostate=torch.cat([state_tokens, action_mask], dim=2).to(self.dtype),
-            hidden_states_visual=img_tokens.to(self.dtype),
-            timestep_action=timesteps_for_action,
-            timestep_video=None,
-            encoder_hidden_states=lang_tokens.to(self.dtype),
-            value=torch.cat([noisy_value, action_mask], dim=2).to(self.dtype) if self.use_value else None,
-            video_kv_mask_mode=video_kv_mask_mode,
-            return_dict=False,
-        )
-        if self.use_value and value is not None:
-            pred_value = pred_action[:, -1:]
-            pred_action = pred_action[:, :-1]
-            target_value = (noise_for_value - value).to(self.dtype)
-        else:
-            pred_value = None
-            target_value = None
-        target_action = (noise_for_action - action_gt).to(self.dtype)
-        if self.noise_scheduler_type != "ddpm":
-            if self.prediction_type == "velocity":
-                v_pred = pred_action.to(self.dtype)
-                v_pred_value = pred_value.detach().to(self.dtype) if pred_value is not None else None
-            elif self.prediction_type == "sample":
-                v_pred = (noise_for_action - pred_action).to(self.dtype)
-                v_pred_value = (
-                    (noise_for_value.detach() - pred_value.detach()).to(self.dtype)
-                    if pred_value is not None
-                    else None
-                )
-            elif self.prediction_type == "noise":
-                v_pred = (pred_action - action_gt).to(self.dtype)
-                v_pred_value = (
-                    (pred_value.detach() - value).to(self.dtype)
-                    if pred_value is not None
-                    else None
-                )
-            else:
-                v_pred = pred_action.to(self.dtype)
-                v_pred_value = pred_value.detach().to(self.dtype) if pred_value is not None else None
-            loss_action = self._masked_mse(v_pred, target_action, action_valid_mask)
-            loss_value = (
-                F.mse_loss(v_pred_value, target_value.detach())
-                if self.use_value and v_pred_value is not None and target_value is not None
-                else None
-            )
-        else:
-            loss_action = self._masked_mse(pred_action.to(self.dtype), target_action, action_valid_mask)
-            loss_value = None
-        return loss_action, loss_value
 
     def _video_condition_with_anchor(
         self,
@@ -2224,111 +1864,6 @@ class FMPRunner(nn.Module,
         }
         return loss_action, loss_video, loss_value
 
-    def _compute_stage3_coa_action_latent_loss(
-        self,
-        *,
-        pred_action: torch.Tensor,
-        target_action: torch.Tensor,
-        action_mask: torch.Tensor,
-        action_valid_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        horizon = target_action.shape[1]
-        action_mask_expanded = action_mask.expand(-1, horizon, -1)
-        pred_encoder_input = torch.cat(
-            [pred_action, action_mask_expanded.to(pred_action.dtype)], dim=2
-        ).to(self.dtype)
-        target_encoder_input = torch.cat(
-            [target_action, action_mask_expanded.to(target_action.dtype)], dim=2
-        ).to(self.dtype)
-        action_encoder = self.model.action_expert.action_encoder
-        pred_latent = action_encoder(pred_encoder_input)
-        target_latent = action_encoder(target_encoder_input)
-        if self.stage3_action_latent_detach_target:
-            target_latent = target_latent.detach()
-        return self._masked_mse(pred_latent, target_latent, action_valid_mask)
-
-    def _compute_stage3_reverse_ar_action_main_loss(
-        self,
-        *,
-        lang_tokens: torch.Tensor,
-        img_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
-        action_gt: torch.Tensor,
-        action_mask: torch.Tensor,
-        action_valid_mask: Optional[torch.Tensor],
-        video_kv_mask_mode: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        pred_action_ar, target_action = self._predict_reverse_ar_action_teacher_forced(
-            lang_tokens=lang_tokens,
-            img_tokens=img_tokens,
-            state_tokens=state_tokens,
-            action_gt=action_gt,
-            action_mask=action_mask,
-            video_kv_mask_mode=video_kv_mask_mode,
-        )
-        reverse_ar_action_loss = self._masked_mse(pred_action_ar, target_action, action_valid_mask)
-        key_valid_mask = (
-            action_valid_mask[:, :1]
-            if action_valid_mask is not None
-            else None
-        )
-        key_action_loss = self._masked_mse(pred_action_ar[:, :1], target_action[:, :1], key_valid_mask)
-        if self.stage3_use_coa_action_loss and self.stage3_action_latent_loss_weight > 0.0:
-            action_latent_loss = self._compute_stage3_coa_action_latent_loss(
-                pred_action=pred_action_ar,
-                target_action=target_action,
-                action_mask=action_mask,
-                action_valid_mask=action_valid_mask,
-            )
-        else:
-            action_latent_loss = target_action.new_zeros(())
-        loss_action = (
-            self.stage3_key_action_loss_weight * key_action_loss
-            + self.stage3_action_ar_loss_weight * reverse_ar_action_loss
-            + self.stage3_action_latent_loss_weight * action_latent_loss
-        )
-        return loss_action, key_action_loss, reverse_ar_action_loss, action_latent_loss
-
-    def _compute_stage4_action_ar_loss(
-        self,
-        *,
-        lang_tokens: torch.Tensor,
-        img_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
-        action_gt: torch.Tensor,
-        action_mask: torch.Tensor,
-        action_valid_mask: Optional[torch.Tensor],
-        video_kv_mask_mode: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        pred_action_ar, target_action = self._predict_reverse_ar_action_teacher_forced(
-            lang_tokens=lang_tokens,
-            img_tokens=img_tokens,
-            state_tokens=state_tokens,
-            action_gt=action_gt,
-            action_mask=action_mask,
-            video_kv_mask_mode=video_kv_mask_mode,
-        )
-        reverse_ar_action_loss = self._masked_mse(pred_action_ar, target_action, action_valid_mask)
-        key_valid_mask = action_valid_mask[:, :1] if action_valid_mask is not None else None
-        key_action_loss = self._masked_mse(pred_action_ar[:, :1], target_action[:, :1], key_valid_mask)
-        prev_detach = self.stage3_action_latent_detach_target
-        self.stage3_action_latent_detach_target = self.stage4_action_latent_detach_target
-        try:
-            action_latent_loss = self._compute_stage3_coa_action_latent_loss(
-                pred_action=pred_action_ar,
-                target_action=target_action,
-                action_mask=action_mask,
-                action_valid_mask=action_valid_mask,
-            )
-        finally:
-            self.stage3_action_latent_detach_target = prev_detach
-        loss_action = (
-            self.stage4_key_action_loss_weight * key_action_loss
-            + self.stage4_action_ar_loss_weight * reverse_ar_action_loss
-            + self.stage4_action_latent_loss_weight * action_latent_loss
-        )
-        return loss_action, key_action_loss, reverse_ar_action_loss, action_latent_loss
-
     # ========= Train  ============
     def compute_loss(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens, action_gt, action_mask,
                      ctrl_freqs, video_latents, condition_video_latents, value=None,
@@ -2348,12 +1883,7 @@ class FMPRunner(nn.Module,
         '''
         batch_size = lang_tokens.shape[0]
         device = lang_tokens.device
-        self.last_stage2_metrics = {}
-        self.last_stage3_metrics = {}
-        self.last_stage4_metrics = {}
         self.last_goal_conditioned_metrics = {}
-        stage2_action_gt = action_gt
-        stage2_action_valid_mask = action_valid_mask
 
         if self.goal_conditioned_wam:
             return self._compute_goal_conditioned_diffusion_loss(
@@ -2368,102 +1898,6 @@ class FMPRunner(nn.Module,
                 action_valid_mask=action_valid_mask,
                 video_kv_mask_mode=video_kv_mask_mode,
             )
-
-        if self.stage4_full_coa_ar:
-            if self.stage4_replace_action_diffusion:
-                loss_action, key_action_loss, reverse_ar_action_loss, action_latent_loss = (
-                    self._compute_stage4_action_ar_loss(
-                        lang_tokens=lang_tokens,
-                        img_tokens=img_tokens,
-                        state_tokens=state_tokens,
-                        action_gt=action_gt,
-                        action_mask=action_mask,
-                        action_valid_mask=action_valid_mask,
-                        video_kv_mask_mode=video_kv_mask_mode,
-                    )
-                )
-                action_metrics = {
-                    "loss_stage4_key_action": key_action_loss.detach(),
-                    "loss_stage4_action_ar": reverse_ar_action_loss.detach(),
-                    "loss_stage4_action_latent": action_latent_loss.detach(),
-                    "loss_stage4_action_main": loss_action.detach(),
-                }
-                loss_value = None
-            else:
-                loss_action, loss_value = self._compute_action_diffusion_loss(
-                    lang_tokens=lang_tokens,
-                    img_tokens=img_tokens,
-                    state_tokens=state_tokens,
-                    action_gt=action_gt,
-                    action_mask=action_mask,
-                    value=value,
-                    action_valid_mask=action_valid_mask,
-                    video_kv_mask_mode=video_kv_mask_mode,
-                )
-                action_metrics = {
-                    "loss_stage4_action_diffusion_fallback": loss_action.detach(),
-                }
-
-            if self.stage4_replace_video_diffusion:
-                loss_video, keyframe_loss, video_ar_loss = self._compute_stage4_video_ar_loss(
-                    lang_tokens=lang_tokens,
-                    state_tokens=state_tokens,
-                    video_latents=video_latents,
-                )
-                video_metrics = {
-                    "loss_stage4_keyframe": keyframe_loss.detach(),
-                    "loss_stage4_video_ar": video_ar_loss.detach(),
-                    "loss_stage4_video_main": loss_video.detach(),
-                }
-            else:
-                loss_video = self._compute_video_diffusion_loss(
-                    lang_tokens=lang_tokens,
-                    video_latents=video_latents,
-                    condition_video_latents=condition_video_latents,
-                    video_kv_mask_mode=video_kv_mask_mode,
-                )
-                video_metrics = {
-                    "loss_stage4_video_diffusion_fallback": loss_video.detach(),
-                }
-
-            self.last_stage4_metrics = {}
-            self.last_stage4_metrics.update(action_metrics)
-            self.last_stage4_metrics.update(video_metrics)
-            return loss_action, loss_video, loss_value
-
-        if self.generation_mode == "reverse_ar" and self.stage3_replace_video_diffusion:
-            raise NotImplementedError(
-                "Stage 3 video reverse-AR replacement is not implemented yet. "
-                "Keep stage3_replace_video_diffusion=false to use video diffusion "
-                "as an explicit fallback while developing the video AR decoder."
-            )
-
-        if self.generation_mode == "reverse_ar" and self.stage3_replace_action_diffusion:
-            loss_action, key_action_loss, reverse_ar_action_loss, action_latent_loss = (
-                self._compute_stage3_reverse_ar_action_main_loss(
-                    lang_tokens=lang_tokens,
-                    img_tokens=img_tokens,
-                    state_tokens=state_tokens,
-                    action_gt=action_gt,
-                    action_mask=action_mask,
-                    action_valid_mask=action_valid_mask,
-                    video_kv_mask_mode=video_kv_mask_mode,
-                )
-            )
-            loss_video = self._compute_video_diffusion_loss(
-                lang_tokens=lang_tokens,
-                video_latents=video_latents,
-                condition_video_latents=condition_video_latents,
-                video_kv_mask_mode=video_kv_mask_mode,
-            )
-            self.last_stage3_metrics = {
-                "loss_stage3_key_action": key_action_loss.detach(),
-                "loss_stage3_reverse_ar_action": reverse_ar_action_loss.detach(),
-                "loss_stage3_action_latent": action_latent_loss.detach(),
-                "loss_stage3_action_main": loss_action.detach(),
-                "loss_stage3_video_diffusion_fallback": loss_video.detach(),
-            }
-            return loss_action, loss_video, None
 
         # Sample noise that we'll add to the actions
         noise_for_action = torch.randn(action_gt.shape, dtype=action_gt.dtype, device=device)
@@ -2539,186 +1973,13 @@ class FMPRunner(nn.Module,
             loss_video = (
                 F.mse_loss(pred_video, target_video, reduction="none") * per_element_loss_mask
             ).sum() / per_element_loss_mask.sum()
-        if (
-            self.stage2_enable_reverse_ar_action
-            and (
-                self.stage2_key_action_loss_weight > 0.0
-                or self.stage2_reverse_ar_action_loss_weight > 0.0
-            )
-        ):
-            key_action_loss, reverse_ar_action_loss = self._compute_stage2_reverse_ar_action_loss(
-                lang_tokens=lang_tokens,
-                img_tokens=img_tokens,
-                state_tokens=state_tokens,
-                action_gt=stage2_action_gt,
-                action_mask=action_mask,
-                action_valid_mask=stage2_action_valid_mask,
-                video_kv_mask_mode=video_kv_mask_mode,
-            )
-            loss_action = (
-                loss_action
-                + self.stage2_key_action_loss_weight * key_action_loss
-                + self.stage2_reverse_ar_action_loss_weight * reverse_ar_action_loss
-            )
-            self.last_stage2_metrics = {
-                "loss_stage2_key_action": key_action_loss.detach(),
-                "loss_stage2_reverse_ar_action": reverse_ar_action_loss.detach(),
-            }
-        # loss = loss_action + loss_video
         return loss_action, loss_video, loss_value
 
     # ========= Inference  ============
-    @torch.no_grad()
-    def conditional_sample_reverse_ar_action_only(
-        self,
-        lang_tokens: torch.Tensor,
-        lang_attn_mask: torch.Tensor,
-        img_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
-        action_mask: torch.Tensor,
-        ctrl_freqs: torch.Tensor,
-    ):
-        """Autoregressively sample the reverse-time action sequence.
-
-        This is the Stage 3 action-only path. It reuses the existing action
-        expert with causal self-attention instead of the action diffusion
-        scheduler. The returned trajectory stays in the training view; callers
-        that execute forward in time should reverse it when
-        ``reverse_world_order=true``.
-        """
-        del lang_attn_mask, ctrl_freqs
-        device = lang_tokens.device
-        dtype = lang_tokens.dtype
-        state_tokens = state_tokens.to(device, dtype=dtype)
-        action_mask = action_mask.to(device, dtype=dtype)
-        img_tokens = img_tokens.to(device, dtype=dtype)
-        batch_size = state_tokens.shape[0]
-        generated = torch.zeros(
-            batch_size,
-            self.pred_horizon,
-            self.state_token_dim,
-            device=device,
-            dtype=dtype,
-        )
-        action_mask_expanded = action_mask.expand(-1, self.pred_horizon, -1)
-        timestep_action = torch.zeros(batch_size, device=device, dtype=torch.long)
-        ar_value = None
-        if self.use_value:
-            zero_value = torch.zeros(batch_size, 1, self.state_token_dim, device=device, dtype=dtype)
-            ar_value = torch.cat([zero_value, action_mask], dim=2)
-
-        for step_idx in range(self.pred_horizon):
-            pred_video_unused, pred_action_ar = self.model(
-                hidden_states_video=None,
-                hidden_states_action=torch.cat([generated, action_mask_expanded], dim=2).to(self.dtype),
-                hidden_states_robostate=torch.cat([state_tokens, action_mask], dim=2).to(self.dtype),
-                hidden_states_visual=img_tokens.to(self.dtype),
-                timestep_action=timestep_action,
-                timestep_video=None,
-                encoder_hidden_states=lang_tokens.to(self.dtype),
-                value=ar_value.to(self.dtype) if ar_value is not None else None,
-                video_kv_mask_mode="off",
-                return_dict=False,
-            )
-            del pred_video_unused
-            next_action = pred_action_ar[:, step_idx : step_idx + 1].to(dtype)
-            generated[:, step_idx : step_idx + 1] = next_action * action_mask
-
-        return {
-            "pred_trajectory": generated * action_mask_expanded,
-            "pred_video": None,
-            "pred_value": None,
-        }
-
-    @torch.no_grad()
-    def conditional_sample_stage4_video_ar(
-        self,
-        *,
-        lang_tokens: torch.Tensor,
-        state_tokens: Optional[torch.Tensor],
-        video_latents: torch.Tensor,
-    ) -> torch.Tensor:
-        device = video_latents.device
-        dtype = video_latents.dtype
-        batch_size, _channels, frames, height, width = video_latents.shape
-        generated = torch.zeros(
-            batch_size,
-            self._noise_video_channels,
-            frames,
-            height,
-            width,
-            device=device,
-            dtype=dtype,
-        )
-        cond = self._stage4_video_condition(
-            lang_tokens=lang_tokens,
-            state_tokens=state_tokens,
-            dtype=dtype,
-        )
-        sos = self.stage4_video_sos.to(device=device, dtype=dtype).expand(
-            batch_size, self._noise_video_channels, 1, height, width
-        )
-        for step_idx in range(frames):
-            shifted = torch.cat([sos, generated[:, :, :-1]], dim=2)
-            head_dtype = next(self.stage4_video_ar_head.parameters()).dtype
-            pred_video = self.stage4_video_ar_head(shifted.to(head_dtype)).to(dtype) + cond
-            generated[:, :, step_idx : step_idx + 1] = pred_video[:, :, step_idx : step_idx + 1]
-        return generated
-
-    @torch.no_grad()
-    def conditional_sample_stage4_full_coa_ar(
-        self,
-        lang_tokens: torch.Tensor,
-        lang_attn_mask: torch.Tensor,
-        img_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
-        action_mask: torch.Tensor,
-        ctrl_freqs: torch.Tensor,
-        video_latents: torch.Tensor,
-        condition_video_latents: torch.Tensor,
-        seed: Optional[int] = 42,
-        num_inference_timesteps: Optional[int] = None,
-    ):
-        del seed
-        if self.stage4_replace_video_diffusion:
-            pred_video = self.conditional_sample_stage4_video_ar(
-                lang_tokens=lang_tokens,
-                state_tokens=state_tokens,
-                video_latents=video_latents,
-            )
-        else:
-            pred_video, _t_last = self.conditional_sample_video_only(
-                lang_tokens=lang_tokens,
-                video_latents=video_latents,
-                condition_video_latents=condition_video_latents,
-            )
-
-        if self.stage4_replace_action_diffusion:
-            action_out = self.conditional_sample_reverse_ar_action_only(
-                lang_tokens=lang_tokens,
-                lang_attn_mask=lang_attn_mask,
-                img_tokens=img_tokens,
-                state_tokens=state_tokens,
-                action_mask=action_mask,
-                ctrl_freqs=ctrl_freqs,
-            )
-        else:
-            action_out = self.conditional_sample_action_only(
-                lang_tokens=lang_tokens,
-                lang_attn_mask=lang_attn_mask,
-                img_tokens=img_tokens,
-                state_tokens=state_tokens,
-                action_mask=action_mask,
-                ctrl_freqs=ctrl_freqs,
-            )
-        action_out["pred_video"] = pred_video
-        return action_out
-
     def predict_action(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens, action_mask, ctrl_freqs, 
                        video_latents, condition_video_latents, video_only=False, action_only=False, 
                        sample_batch_size=1, video_denoise_steps: Optional[int] = None,
-                       video_then_action: bool = False, seed: Optional[int] = 42,
-                       video_then_action_guidance_scale: float = 1.0, video_then_action_use_cfg: bool = False,
+                       seed: Optional[int] = 42,
                        use_mean_flow: bool = False, num_inference_timesteps: Optional[int] = None):
         '''
         lang_tokens: (batch_size, lang_len, lang_token_dim)
@@ -2729,11 +1990,8 @@ class FMPRunner(nn.Module,
         action_mask: (batch_size, 1, action_dim),
             which should be a 0-1 **float** tensor.
         ctrl_freqs: (batch_size,), control frequency for each sample.
-        video_denoise_steps: ``video_only`` / ``video_then_action`` 时传给视频去噪阶段的步数上限。
-        video_then_action: 为 True 时调用 ``conditional_sample_video_then_action``（先视频去噪再动作去噪），
-            与 ``video_only`` / ``action_only`` 互斥；若同时为 True，以 ``video_then_action`` 为准。
-        seed: ``video_then_action`` 时传给两阶段采样的随机种子。
-        video_then_action_guidance_scale / video_then_action_use_cfg: 第二阶段动作分支 CFG 参数。
+        video_denoise_steps: ``video_only`` 时传给视频去噪阶段的步数上限。
+        seed: goal-conditioned 多步采样的随机种子。
         num_inference_timesteps: 推理扩散步数；``None`` 表示使用配置里的 ``self.num_inference_timesteps``。
 
         return: (batch_size, horizon, action_dim), predicted action sequence
@@ -2770,87 +2028,7 @@ class FMPRunner(nn.Module,
                 num_inference_timesteps=num_inference_timesteps,
             )
 
-        # (1) 准备输入
-        # (2) 调用扩散采样
-        if self.stage4_full_coa_ar and not video_then_action:
-            if video_only and not action_only:
-                if self.stage4_replace_video_diffusion:
-                    video_pred = self.conditional_sample_stage4_video_ar(
-                        lang_tokens=lang_tokens,
-                        state_tokens=state_tokens,
-                        video_latents=video_latents,
-                    )
-                else:
-                    video_pred, _t_last = self.conditional_sample_video_only(
-                        lang_tokens,
-                        video_latents,
-                        condition_video_latents,
-                        denoise_steps=video_denoise_steps,
-                        num_inference_timesteps=num_inference_timesteps,
-                    )
-                return {
-                    "pred_trajectory": None,
-                    "pred_video": video_pred,
-                    "pred_value": None,
-                }
-            if action_only and not video_only:
-                if self.stage4_replace_action_diffusion:
-                    return self.conditional_sample_reverse_ar_action_only(
-                        lang_tokens=lang_tokens,
-                        lang_attn_mask=lang_attn_mask,
-                        img_tokens=img_tokens,
-                        state_tokens=state_tokens,
-                        action_mask=action_mask,
-                        ctrl_freqs=ctrl_freqs,
-                    )
-                return self.conditional_sample_action_only(
-                    lang_tokens,
-                    lang_attn_mask,
-                    img_tokens,
-                    state_tokens,
-                    action_mask,
-                    ctrl_freqs,
-                    num_inference_timesteps=num_inference_timesteps,
-                )
-            return self.conditional_sample_stage4_full_coa_ar(
-                lang_tokens=lang_tokens,
-                lang_attn_mask=lang_attn_mask,
-                img_tokens=img_tokens,
-                state_tokens=state_tokens,
-                action_mask=action_mask,
-                ctrl_freqs=ctrl_freqs,
-                video_latents=video_latents,
-                condition_video_latents=condition_video_latents,
-                seed=seed,
-                num_inference_timesteps=num_inference_timesteps,
-            )
-        if self.generation_mode == "reverse_ar" and action_only and not video_only:
-            return self.conditional_sample_reverse_ar_action_only(
-                lang_tokens=lang_tokens,
-                lang_attn_mask=lang_attn_mask,
-                img_tokens=img_tokens,
-                state_tokens=state_tokens,
-                action_mask=action_mask,
-                ctrl_freqs=ctrl_freqs,
-            )
-        if video_then_action:
-            out = self.conditional_sample_video_then_action(
-                lang_tokens=lang_tokens,
-                lang_attn_mask=lang_attn_mask,
-                img_tokens=img_tokens,
-                state_tokens=state_tokens,
-                action_mask=action_mask,
-                ctrl_freqs=ctrl_freqs,
-                video_latents=video_latents,
-                condition_video_latents=condition_video_latents,
-                seed=seed,
-                guidance_scale_action=video_then_action_guidance_scale,
-                use_cfg_action=video_then_action_use_cfg,
-                video_denoise_steps=video_denoise_steps,
-                num_inference_timesteps=num_inference_timesteps,
-                use_mean_flow=use_mean_flow,
-            )
-        elif video_only and not action_only:
+        if video_only and not action_only:
             video_pred, _t_last = self.conditional_sample_video_only(
                 lang_tokens,
                 video_latents,

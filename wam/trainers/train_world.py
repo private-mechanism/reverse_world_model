@@ -987,7 +987,7 @@ def train(args, logger):
     if accelerator.is_main_process and args.reverse_world_order:
         logger.info(
             "reverse_world_order=true: world training/sampling flips video and action targets in time "
-            "(oracle fixed-horizon reverse WVWAM stage)."
+            "(goal-conditioned fixed-horizon reverse diffusion)."
         )
 
     extra_log_metrics = {}
@@ -1071,30 +1071,6 @@ def train(args, logger):
                     "lr": lr_scheduler.get_last_lr()[0],
                 }
                 metric_model = accelerator.unwrap_model(train_module.model)
-                stage2_metrics = getattr(metric_model, "last_stage2_metrics", None)
-                if stage2_metrics:
-                    logs.update(
-                        {
-                            key: value.detach().item() if torch.is_tensor(value) else float(value)
-                            for key, value in stage2_metrics.items()
-                        }
-                    )
-                stage3_metrics = getattr(metric_model, "last_stage3_metrics", None)
-                if stage3_metrics:
-                    logs.update(
-                        {
-                            key: value.detach().item() if torch.is_tensor(value) else float(value)
-                            for key, value in stage3_metrics.items()
-                        }
-                    )
-                stage4_metrics = getattr(metric_model, "last_stage4_metrics", None)
-                if stage4_metrics:
-                    logs.update(
-                        {
-                            key: value.detach().item() if torch.is_tensor(value) else float(value)
-                            for key, value in stage4_metrics.items()
-                        }
-                    )
                 goal_conditioned_metrics = getattr(
                     metric_model, "last_goal_conditioned_metrics", None
                 )

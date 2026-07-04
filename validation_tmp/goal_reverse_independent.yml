@@ -1,14 +1,11 @@
 # =============================================================================
-# Goal-conditioned reverse diffusion WVWAM.
+# Independent Goal-Conditioned Reverse Diffusion WVWAM。
 #
-# Final design:
-#   1. Predict key video/action with diffusion losses.
-#   2. Detach predicted key conditions by default.
-#   3. Use predicted key video as reverse-video latent anchor.
-#   4. Use predicted key action chunk as reverse-action clean prefix.
-#   5. Keep the core generator as diffusion, not AR replacement.
-#   6. At inference, sample both keys from pure noise with multiple steps.
-#   7. Clamp keys during reverse sampling and return actions in forward order.
+# 数据先按时间维翻转，因此 reverse 序列的第 0 个位置对应原轨迹的 horizon 终点。
+# 第一阶段：video/action 分别从纯噪声预测 horizon key-video 与 key-action chunk。
+# 第二阶段：固定并 detach 两个 predicted key，video/action 再分别从 key 向当前时刻逆向生成。
+# 推理输出的 reverse action 最后翻回正常时间顺序，供机器人正向执行。
+# “Independent”表示两个 expert 的 key 预测和 reverse 去噪分别调用，不做 video/action 联合去噪。
 # =============================================================================
 schema_version: 2
 num_sample_batches: 1
@@ -16,13 +13,14 @@ num_sample_batches: 1
 sample_video_metric_period: 2
 sample_video_visual_period: 200
 sample_video_visual_on_step0: true
+# 同时保存把 reverse GT/Pred 翻回正常时间顺序的视图，便于人工判断运动质量。
 sample_save_forward_view: true
 sample_video_max_rank: 2
 
 experiment:
   id: goal-conditioned-reverse-diffusion
   wandb_project: Reverse-WVWAM-Validation
-  config_name: goal_conditioned_reverse_diffusion
+  config_name: goal_reverse_independent
   cuda_visible_devices: "0,1"
 
 data:
@@ -33,6 +31,7 @@ data:
     use_prompt_template: false
   common:
     img_history_size: 1
+    # 固定 horizon 内包含 32 个 action step；翻转后模型顺序为 t+H -> t。
     action_chunk_size: 32
     num_cameras: 3
     num_vision_patches: 729
@@ -48,9 +47,11 @@ data:
     image_aspect_ratio: pad
     tokenizer_max_length: 1024
     pred_video: true
+    # 每 1 个 action step 取一个视频时刻；与 action_chunk_size 一起决定 reverse 视频长度。
     sample_video_fps: 1
     video_size: [384, 320]
     num_cameras: 3
+    # 固定长度连续子轨迹；其原始末端 x_{t+H}/a_{t+H} 被定义为 horizon key。
     subtrajectory_mode: fixed_horizon
 
 architecture:
@@ -72,11 +73,16 @@ architecture:
       use_new_rope: true
       scaling: 4.0
       use_value: false
+      # 开启 Action Expert 帧级 causal self-attention：reverse 位置 i 只能看当前位置及其 reverse 前缀。
       frame_causal_self_attn: true
+    # 开启 Video Expert 帧级 causal self-attention：reverse 帧只能依赖 key 侧已出现的帧。
     video_frame_causal_self_attn: true
+    # Independent 不让 action query 通过联合 forward 读取 video KV；两条 diffusion 路径独立计算。
+    action_video_frame_causal_kv: false
     action_noise_scheduler:
       type: flow
       num_train_timesteps: 1000
+      # 两阶段推理均使用 5 步：先对 key 去噪，再对完整 reverse trajectory 去噪。
       num_inference_timesteps: 5
       beta_schedule: squaredcos_cap_v2
       prediction_type: sample
@@ -86,8 +92,10 @@ architecture:
       noise_s: 0.999
       distribution_type: beta
 
+  # 该模型类提供 causal mask 能力；实际 mask 组合由上面三个开关定义。
   model_name: world_policy_causal_value
   video_variant: wow1.3b
+  # 选择 train_world 的联合 world-policy 训练入口；它本身不等同于开启 causal attention。
   causal_world_training: true
   dataset_type: 128dim_with_value
   image_aug_type: mixed
@@ -104,32 +112,38 @@ weights:
   video_base_model: /mnt/damoxing/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
 
 training:
+  # 三方案总开关：选择 video/action 独立预测的 Goal-Conditioned Reverse 路径。
+  world_generation_variant: goal_reverse_independent
+  # true：进入 Runner 前同时翻转 video 和 action 时间维，使序列从 horizon key 指向当前时刻。
   reverse_world_order: true
-  generation_mode: diffusion
-  goal_conditioned_wam: true
+  # 训练 key-video diffusion 分支；目标是 reverse 序列第 0 帧，即原始 x_{t+H}。
   predict_key_video: true
+  # 训练 key-action diffusion 分支；目标是 reverse 序列开头的 horizon action chunk。
   predict_key_action: true
+  # key-action 由 reverse 序列最前面的 4 个动作组成，对应原轨迹末端附近的 4 个动作。
   key_action_chunk_size: 4
+  # Reverse 阶段使用模型预测的 key，而不是 GT key，缩小训练与部署条件差异。
   use_predicted_key_condition: true
+  # 切断 reverse loss 到 key predictor 的梯度；两个 key 作为固定条件，避免两阶段互相投机。
   detach_predicted_key_condition: true
+  # 将 predicted key-video latent 写入 WoW 首帧条件通道，并在 reverse 去噪时作为锚点固定。
   reverse_video_key_condition_type: latent_inpainting
+  # 将 predicted key-action chunk 写入 reverse action 序列前缀；前缀位置不计 reverse action loss。
   reverse_action_key_condition_type: prefix
+  # key-video diffusion loss 在 video 总 loss 中的权重。
   key_video_loss_weight: 1.0
+  # key-action diffusion loss 在 action 总 loss 中的权重。
   key_action_loss_weight: 1.0
+  # 完整 reverse-video diffusion loss 在 video 总 loss 中的权重。
   reverse_video_loss_weight: 1.0
+  # 完整 reverse-action diffusion loss 在 action 总 loss 中的权重。
   reverse_action_loss_weight: 1.0
+  # 推理启用真实两阶段多步采样：纯噪声 -> predicted keys -> reverse video/action。
   goal_conditioned_multistep_inference: true
+  # 将生成的 reverse action 沿时间维翻回 t -> t+H 后返回，供环境按正序执行。
   goal_conditioned_return_forward_actions: true
+  # 仅用于 video 的 classifier-free guidance；1.0 表示关闭，5.0 表示增强语言条件。
   goal_conditioned_video_guidance_scale: 5.0
-  stage2_enable_reverse_ar_action: false
-  stage2_key_action_loss_weight: 0.0
-  stage2_reverse_ar_action_loss_weight: 0.0
-  stage3_replace_video_diffusion: false
-  stage3_replace_action_diffusion: false
-  stage3_use_coa_action_loss: false
-  stage4_full_coa_ar: false
-  stage4_replace_video_diffusion: false
-  stage4_replace_action_diffusion: false
   batch:
     train: 2
     sample: 2
@@ -138,6 +152,7 @@ training:
   checkpointing_period: 1000
   sample_period: 50
   sample_light: false
+  # 评估时走 world sampler；Goal 路径内部仍按 Independent 方式分别采样 video/action。
   sample_joint_only: true
   sample_sharded_inference: false
   sample_compute_video_metrics: true
@@ -176,4 +191,5 @@ runtime:
 distributed:
   deepspeed: off
 
+# 当前没有额外的部署期覆盖项；两阶段扩散步数由 action_noise_scheduler 控制。
 inference: {}
