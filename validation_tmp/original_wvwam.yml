@@ -1,30 +1,25 @@
 # =============================================================================
-# Stage 1 validation: fixed-horizon oracle reverse WVWAM.
+# 原始正向 WVWAM 基线。
 #
-# Goal:
-#   Verify that WVWAM can learn reverse-time video/action targets when the
-#   terminal video frame is still provided by the GT fixed-horizon clip.
-#
-# What this enables:
-#   - subtrajectory_mode=fixed_horizon samples length-32 action chunks.
-#   - reverse_world_order=true flips video/action targets in world training.
-#   - video/action metrics are computed in the same reverse target view.
-#   - forward_view videos are also saved for human inspection.
+# 条件：任务指令 + 当前状态/原始首帧。
+# 目标：按正常时间顺序联合生成未来 video 和 action。
+# 本方案不翻转时间顺序，不预测 horizon key，不使用 key condition，也不开启
+# 帧级 causal attention。它用于和两个 Goal-Conditioned Reverse 方案公平对比。
 # =============================================================================
 schema_version: 2
 num_sample_batches: 1
 
-# Extra flat keys supported by the config loader.
 sample_video_metric_period: 2
 sample_video_visual_period: 200
 sample_video_visual_on_step0: true
+# 正向基线本身已经是正常时间顺序；该开关主要为 reverse 方案保存翻回正序的观察视图。
 sample_save_forward_view: true
 sample_video_max_rank: 2
 
 experiment:
-  id: stage1-reverse-world-oracle
+  id: original-wvwam-baseline
   wandb_project: Reverse-WVWAM-Validation
-  config_name: stage1_reverse_world_oracle
+  config_name: original_wvwam
   cuda_visible_devices: "0,1"
 
 data:
@@ -35,6 +30,7 @@ data:
     use_prompt_template: false
   common:
     img_history_size: 1
+    # 固定 horizon 内包含 32 个 action step；正向基线直接按 t -> t+H 学习。
     action_chunk_size: 32
     num_cameras: 3
     num_vision_patches: 729
@@ -50,9 +46,11 @@ data:
     image_aspect_ratio: pad
     tokenizer_max_length: 1024
     pred_video: true
+    # 每 1 个 action step 取一个视频时刻；与 action_chunk_size 一起决定预测视频长度。
     sample_video_fps: 1
     video_size: [384, 320]
     num_cameras: 3
+    # 使用固定长度连续子轨迹；本方案不把末端帧/动作额外定义为 key condition。
     subtrajectory_mode: fixed_horizon
 
 architecture:
@@ -74,9 +72,16 @@ architecture:
       use_new_rope: true
       scaling: 4.0
       use_value: false
+      # Action Expert 的时间维 self-attention 不加因果 mask，可双向查看整个 action chunk。
+      frame_causal_self_attn: false
+    # Video Expert 的帧级 self-attention 不加因果 mask，可双向查看整个视频序列。
+    video_frame_causal_self_attn: false
+    # Action query 不启用按帧对齐的 video KV 因果限制；原始 WVWAM 使用完整联合注意力。
+    action_video_frame_causal_kv: false
     action_noise_scheduler:
       type: flow
       num_train_timesteps: 1000
+      # 推理时从纯噪声到样本执行 5 次调度更新；原始方案对完整 video/action 联合采样。
       num_inference_timesteps: 5
       beta_schedule: squaredcos_cap_v2
       prediction_type: sample
@@ -86,14 +91,16 @@ architecture:
       noise_s: 0.999
       distribution_type: beta
 
+  # 该模型类具备 causal mask 能力，但是否真正启用由上面三个 causal 开关决定。
   model_name: world_policy_causal_value
   video_variant: wow1.3b
+  # 选择 train_world 的联合 world-policy 训练入口；它不代表 causal attention 已开启。
   causal_world_training: true
   dataset_type: 128dim_with_value
   image_aug_type: mixed
 
 checkpoints:
-  run_name: validation-stage1-reverse-world-oracle
+  run_name: validation-original-wvwam-baseline
   root_dir: /mnt/world_foundational_model/fyzhao/reverse_world_model/checkpoints/
 
 weights:
@@ -104,7 +111,10 @@ weights:
   video_base_model: /mnt/damoxing/datasets/cjt_personal/pretrained_models/WoW-1-Wan-1.3B-2M-Diffusers
 
 training:
-  reverse_world_order: true
+  # 三方案总开关：original 进入原始联合 forward diffusion loss 和推理路径。
+  world_generation_variant: original
+  # false：训练和采样均保持数据集原始时间顺序，不翻转 video/action。
+  reverse_world_order: false
   batch:
     train: 2
     sample: 2
@@ -113,6 +123,7 @@ training:
   checkpointing_period: 1000
   sample_period: 50
   sample_light: false
+  # 评估时只运行联合 world sampling，不额外运行 action-only sampler。
   sample_joint_only: true
   sample_sharded_inference: false
   sample_compute_video_metrics: true
@@ -138,7 +149,8 @@ optimizer:
     hold_ratio: 0.2
 
 logging:
-  report_to: wandb
+  report_to: tensorboard
+  logging_dir: tensorboard
   resume_from_checkpoint: null
 
 runtime:
@@ -150,4 +162,5 @@ runtime:
 distributed:
   deepspeed: off
 
+# 当前没有额外的部署期覆盖项；扩散步数由 action_noise_scheduler 控制。
 inference: {}

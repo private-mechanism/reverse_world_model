@@ -3,10 +3,10 @@ set -eo pipefail
 
 usage() {
   cat <<'EOF'
-Run WVWAM Stage 2 checkpoint in RoboTwin online success-rate evaluation.
+Run one of the three supported WVWAM variants in RoboTwin evaluation.
 
 Usage:
-  scripts/run_robotwin_stage2_success_rate.sh \
+  scripts/run_robotwin_success_rate.sh \
     --robotwin_root /path/to/RoboTwin \
     --config /path/to/robotwin_eval_config.yml \
     [extra eval_policy.py args...]

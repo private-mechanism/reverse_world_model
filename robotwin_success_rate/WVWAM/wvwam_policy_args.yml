@@ -4,19 +4,17 @@
 policy_name: WVWAM.deploy_policy
 
 wam_repo: /mnt/world_foundational_model/fyzhao/reverse_world_model
-model_config_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/validation_tmp/stage2_coa_semantic_reverse_ar.yml
-checkpoint_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/checkpoints/validation-stage2-coa-semantic-reverse-ar/checkpoint-1000
+model_config_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/validation_tmp/goal_reverse_joint.yml
+checkpoint_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/checkpoints/validation-goal-conditioned-joint-reverse-diffusion/checkpoint-1000
 statistics_path: /mnt/damoxing/datasets/RoboTwin2_0_processed/robotwin_clean_5k_2/separate_statistics-state_dim128.json
 
 device: cuda
 dtype: bf16
 
-# Initial online version: action expert only. Video branch is not used because
-# RoboTwin online env does not provide GT future video latents.
-action_only: true
+# Joint mode builds the current video latent from online observations.
+action_only: false
 
-# Stage 1 / Stage 2 reverse checkpoints output a reverse-view action chunk.
-# The deploy wrapper flips the chunk back to forward order before execution.
+# Goal reverse checkpoints return forward-order actions for execution.
 reverse_world_order: true
 
 # RoboTwin qpos action usually has 14 dims for bimanual qpos + gripper.
@@ -35,4 +33,3 @@ eval_steps_per_call: 1
 
 num_inference_timesteps: 5
 camera_keys: head_camera,right_camera,left_camera
-

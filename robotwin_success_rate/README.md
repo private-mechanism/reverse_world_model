@@ -36,10 +36,10 @@ The important fields are:
 
 ```yaml
 wam_repo: /mnt/world_foundational_model/fyzhao/reverse_world_model
-model_config_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/validation_tmp/stage2_coa_semantic_reverse_ar.yml
-checkpoint_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/checkpoints/validation-stage2-coa-semantic-reverse-ar/checkpoint-1000
+model_config_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/validation_tmp/goal_reverse_joint.yml
+checkpoint_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/checkpoints/validation-goal-conditioned-joint-reverse-diffusion/checkpoint-1000
 statistics_path: /mnt/damoxing/datasets/RoboTwin2_0_processed/robotwin_clean_5k_2/separate_statistics-state_dim128.json
-action_only: true
+action_only: false
 reverse_world_order: true
 action_dim: 14
 action_type: qpos
@@ -64,17 +64,13 @@ The exact task config path depends on the RoboTwin task you want to evaluate.
 - Reads RoboTwin online observations.
 - Uses `head_camera`, `right_camera`, and `left_camera` RGB images.
 - Uses `joint_action.vector` or qpos-like state fields as the robot state.
-- Runs action-only diffusion inference for the first online success-rate test.
-- Flips the predicted action chunk back to forward time when
-  `reverse_world_order=true`.
+- Supports `original`, `goal_reverse_independent`, and `goal_reverse_joint`.
+- Builds online video latents when `action_only=false`.
+- Avoids double flipping when a Goal reverse model already returns forward actions.
 - Denormalizes actions using the RoboTwin training statistics.
 - Executes qpos actions through `TASK_ENV.take_action(action, action_type="qpos")`.
 
 ## Notes
 
-The first online version intentionally uses `action_only=true`. The current
-reverse video/action training still uses oracle keyframes for the video branch,
-while the online RoboTwin environment only provides the current observation.
-The full video+action reverse autoregressive rollout should be added after the
-keyframe predictor is connected for inference.
-
+Use `action_only=false` for the joint Goal variant. Set `action_only=true` only
+for an explicit action-only ablation.

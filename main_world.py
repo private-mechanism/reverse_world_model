@@ -113,12 +113,9 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         help=(
-            "Path or name of a pretrained checkpoint to load the model from.\n",
-            "   This can be either:\n"
-            "   - a string, the *model id* of a pretrained model hosted inside a model repo on huggingface.co, e.g., `robotics-diffusion-transformer/rdt-1b`,\n"
-            "   - a path to a *directory* containing model weights saved using [`~RDTRunner.save_pretrained`] method, e.g., `./my_model_directory/`.\n"
-            "   - a path to model checkpoint (*.pt), .e.g, `my_model_directory/checkpoint-10000/pytorch_model/mp_rank_00_model_states.pt`"
-            "   - `None` if you are randomly initializing model using configuration at `config_path`.",
+            "Path or name of a pretrained checkpoint. This can be a Hub model id, "
+            "a local save_pretrained directory, a training checkpoint directory, "
+            "or None for config initialization."
         ),
     )
     parser.add_argument(
@@ -370,27 +367,6 @@ def parse_args(input_args=None):
         default=False,
         dest="reverse_world_order",
         help="WVWAM 训练/采样时将 video 与 action 目标同时按时间维翻转，用于第一阶段 oracle reverse world 实验。",
-    )
-    parser.add_argument(
-        "--stage2-enable-reverse-ar-action",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        dest="stage2_enable_reverse_ar_action",
-        help="启用 Stage 2 CoA-style teacher-forced reverse-AR action 辅助训练损失。",
-    )
-    parser.add_argument(
-        "--stage2-key-action-loss-weight",
-        type=float,
-        default=0.0,
-        dest="stage2_key_action_loss_weight",
-        help="Stage 2 key action 辅助损失权重；key action 是逆序有效 action 的第一个 token。",
-    )
-    parser.add_argument(
-        "--stage2-reverse-ar-action-loss-weight",
-        type=float,
-        default=0.0,
-        dest="stage2_reverse_ar_action_loss_weight",
-        help="Stage 2 teacher-forced reverse-AR action 序列辅助损失权重。",
     )
     parser.add_argument(
         "--sample-video-max-rank",

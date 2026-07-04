@@ -1,24 +1,24 @@
-# Example RoboTwin eval config for WVWAM Stage 2 online success-rate testing.
+# Example RoboTwin eval config for joint goal-conditioned WVWAM.
 # Run from this repo:
-#   scripts/run_robotwin_stage2_success_rate.sh \
+#   scripts/run_robotwin_success_rate.sh \
 #     --robotwin_root /mnt/world_foundational_model/pd_data/RoboTwin \
-#     --config /mnt/world_foundational_model/fyzhao/reverse_world_model/robotwin_success_rate/stage2_place_empty_cup_eval.yml
+#     --config /mnt/world_foundational_model/fyzhao/reverse_world_model/robotwin_success_rate/place_empty_cup_eval.yml
 
 task_name: place_empty_cup
 task_config: demo_clean
-ckpt_setting: stage2-coa-semantic-reverse-ar-checkpoint-1000
+ckpt_setting: goal-reverse-joint-checkpoint-1000
 policy_name: WVWAM.deploy_policy
 instruction_type: seen
 seed: 0
 
 wam_repo: /mnt/world_foundational_model/fyzhao/reverse_world_model
-model_config_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/validation_tmp/stage2_coa_semantic_reverse_ar.yml
-checkpoint_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/checkpoints/validation-stage2-coa-semantic-reverse-ar/checkpoint-1000
+model_config_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/validation_tmp/goal_reverse_joint.yml
+checkpoint_path: /mnt/world_foundational_model/fyzhao/reverse_world_model/checkpoints/validation-goal-conditioned-joint-reverse-diffusion/checkpoint-1000
 statistics_path: /mnt/damoxing/datasets/RoboTwin2_0_processed/robotwin_clean_5k_2/separate_statistics-state_dim128.json
 
 device: cuda
 dtype: bf16
-action_only: true
+action_only: false
 reverse_world_order: true
 action_dim: 14
 action_type: qpos
@@ -27,4 +27,3 @@ replan_interval: 8
 eval_steps_per_call: 1
 num_inference_timesteps: 5
 camera_keys: head_camera,right_camera,left_camera
-
